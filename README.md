@@ -26,7 +26,7 @@ failure to apply rather than as a silently different artifact.
 
 These patches are a derivative work of KernelSU and are distributed under
 KernelSU's own terms, which differ by directory. Each hunk is licensed as the
-upstream file it modifies:
+upstream file it modifies, whichever patch file it happens to sit in:
 
 | Hunks under | Licence | Copy in this repository |
 | --- | --- | --- |
@@ -37,37 +37,74 @@ Both licence files are verbatim copies of the corresponding files in the
 upstream tree at the commit above. Nothing here is relicensed, and no
 Apache-2.0 terms apply to any file in this repository.
 
-## Contents
+## Layout
 
-### `patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch`
+A patch is scoped as narrowly as it can be, so that a build compiles only what
+it is actually the reason for. Each directory under `patches/` is one **patch
+set**, and a set is either always applied or named by the build that wants it:
 
-One patch carrying two independent halves.
+| Set | Applied to | Holds |
+| --- | --- | --- |
+| `common/` | every build, always, first | what no target can boot without |
+| `galaxy/` | builds that name it | Samsung KDP / RKP / DEFEX |
+| `oppo/` | builds that name it | OPPO, OnePlus and realme — [empty today](patches/oppo/README.md) |
+| `devices/<id>/` | the one build that names it | what nothing else can use — [empty today](patches/devices/README.md) |
 
-The **`userspace/ksud` half is required by every target**, on any vendor's
-firmware. Upstream late-load could not write a new `/data/adb/ksud` after the
-module changed the loader's security context — the destination stayed a
-zero-byte file. The patch stages the daemon at `/data/local/tmp/.ksud-stage`,
-renames it onto the same `/data` filesystem before loading the module, and
-finishes labels and assets once the module is active.
+Within a set the patches apply in filename order, hence the `NNNN-` prefixes.
+The sets apply in the order `common`, then whatever the build named, in the
+order it named them.
 
-The **`kernel/` half is compiled out unless a target enables it**, through
-`CONFIG_KSU_SAMSUNG_{KDP,RKP,DEFEX}`. It exists because a generic build panics
-on Samsung firmware: an inline `put_cred()` writes directly to a KDP-protected
-credential refcount, RKP rejects the write to an unused syscall-table slot while
-the generic code still treats the dispatcher as installed, and DEFEX keeps its
-own task credential tuple that a KernelSU UID transition leaves unsynchronised.
-Under those options the patch resolves `kdp_usecount_dec_and_test()` and
-`kdp_assign_pgd()` from the running kernel, installs credentials through
-`prepare_ro_creds()`, synchronises the DEFEX record, records a syscall-table
-hook only if the RKP-protected write succeeds, and otherwise falls back to
-kretprobe/kprobe sucompat.
+Nothing outside `common/` is compiled into a build that did not ask for it,
+because it is not applied to that build's tree at all. Kernel options such as
+`CONFIG_KSU_SAMSUNG_{KDP,RKP,DEFEX}` still gate the code inside a set, but they
+gate source that is only present once the set has been applied.
+
+Which sets a build takes is declared where the build is, not here:
+Root-My-Device-Payloads reads a `patchSets` array out of each target's
+`kernelsu.json`. A name that resolves to a directory with no patches in it —
+because it was misspelled, or because the set is still a placeholder — fails
+that build rather than being quietly skipped.
+
+### `common/`
+
+**Required by every target**, on any vendor's firmware.
+
+`0001-ksud-staged-late-load.patch` — upstream late-load could not write a new
+`/data/adb/ksud` after the module changed the loader's security context: the
+destination stayed a zero-byte file. The patch stages the daemon at
+`/data/local/tmp/.ksud-stage`, renames it onto the same `/data` filesystem
+before loading the module, and finishes labels and assets once the module is
+active. Removing it breaks installation everywhere.
+
+`0002-kbuild-include-paths.patch` — the include paths a build out of a DDK
+image needs, where the SELinux headers are reachable through `objtree` and not
+only through `srctree`.
+
+### `galaxy/`
+
+`0001-samsung-kdp-rkp-defex.patch` — a generic build panics on Samsung
+firmware: an inline `put_cred()` writes directly to a KDP-protected credential
+refcount, RKP rejects the write to an unused syscall-table slot while the
+generic code still treats the dispatcher as installed, and DEFEX keeps its own
+task credential tuple that a KernelSU UID transition leaves unsynchronised.
+
+The patch resolves `kdp_usecount_dec_and_test()` and `kdp_assign_pgd()` from the
+running kernel, installs credentials through `prepare_ro_creds()`, synchronises
+the DEFEX record, records a syscall-table hook only if the RKP-protected write
+succeeds, and otherwise falls back to kretprobe/kprobe sucompat. Each of the
+three is behind its own `CONFIG_KSU_SAMSUNG_*` option, which the build passes
+alongside the set.
 
 ## Applying by hand
 
 ```sh
 git clone https://github.com/tiann/KernelSU
 git -C KernelSU checkout b0bc817b4e966aa6aa830834eaf6ef765d821d40
-git -C KernelSU apply /path/to/patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch
+
+# every build
+git -C KernelSU apply /path/to/patches/common/*.patch
+# and then whatever the target asks for, in the order it asks
+git -C KernelSU apply /path/to/patches/galaxy/*.patch
 ```
 
 The build procedure, including the DDK images and the load-time contracts a
