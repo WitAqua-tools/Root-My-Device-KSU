@@ -42,16 +42,18 @@ will talk to at all**, which makes it the bottom of the window rather than an
 arbitrary choice. Anything below it is not a version this repository can carry a
 patch for — it would build a module the manager refuses.
 
-Three, because that is enough to be able to move: the tag the builds pin, one
-step back that still works if a release turns out to regress something, and
-`main` ahead of it so the next bump is a pin move rather than a rebase under
-time pressure. Adding a fourth means dropping the oldest.
+Three, because that is enough to be able to move in either direction without a
+rebase first: the tag the builds pin, `main` ahead of it so the next bump is a
+pin move rather than a rebase under time pressure, and the floor behind it to
+fall back to if a release turns out to regress something. Adding a fourth means
+dropping the one furthest from the pin.
 
 ### Moving to a newer upstream
 
-Copy the newest `patches/<old>` to `patches/<new>`, rebase the hunks until they
-apply to the new commit, drop the oldest of the four, and move the submodule pin
-in Root-My-Device-Payloads.
+Copy the nearest `patches/<old>` to `patches/<new>`, rebase the hunks until they
+apply to the new commit, drop the fourth, and move the submodule pin in
+Root-My-Device-Payloads. Nothing below 32514 may be the one kept, for the reason
+above.
 
 The build derives the directory from the pin it already holds, so the version is
 never written down twice and cannot disagree with itself — a pin whose directory
