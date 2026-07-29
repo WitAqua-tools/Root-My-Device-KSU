@@ -1,0 +1,145 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index 0a71aca3..823b39b9 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -1,7 +1,6 @@
+ use anyhow::{Context, Result};
+ use log::{info, warn};
+ use rustix::cstr;
+-use std::process::Command;
+ 
+ use crate::module::{handle_updated_modules, prune_modules};
+ use crate::{assets, defs, init_event, metamodule, restorecon, utils};
+@@ -35,11 +34,14 @@ fn dump_process_info(label: &str) {
+     );
+ }
+ 
+-pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
+-    utils::daemonize(false)?;
++pub fn run(_package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
+     info!("late-load command triggered!");
+     dump_process_info("late-load start");
+ 
++    // Copy the daemon before loading the module changes this process's
++    // security context. The remaining install steps require KernelSU policy.
++    utils::stage_daemon_from("/data/local/tmp/.ksud-stage").context("Failed to stage ksud")?;
++
+     // 1. Check if KernelSU is already loaded
+     if ksuinit::has_kernelsu() {
+         info!("KernelSU already loaded, skip loading ko");
+@@ -78,7 +80,7 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
+         warn!("clear temp configs failed: {e}");
+     }
+ 
+-    utils::install(None).context("Failed to install ksud")?;
++    utils::finish_install(None).context("Failed to finish ksud installation")?;
+ 
+     // 5. Handle module updates
+     if let Err(e) = handle_updated_modules() {
+@@ -129,18 +131,5 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
+     // 13. Execute boot-completed stage scripts (non-blocking)
+     init_event::run_stage("boot-completed", false);
+ 
+-    // 14. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module
+-    info!("Restarting KernelSU Manager {package_name}...");
+-    let _ = Command::new("am")
+-        .args(["force-stop", package_name])
+-        .status();
+-    let _ = Command::new("am")
+-        .args([
+-            "start",
+-            "-n",
+-            &format!("{package_name}/me.weishu.kernelsu.ui.MainActivity"),
+-        ])
+-        .status();
+-
+     Ok(())
+ }
+diff --git a/userspace/ksud/src/utils.rs b/userspace/ksud/src/utils.rs
+index 852637b4..f8e5f393 100644
+--- a/userspace/ksud/src/utils.rs
++++ b/userspace/ksud/src/utils.rs
+@@ -1,7 +1,8 @@
+ use anyhow::{Context, Error, Ok, Result, bail};
+-use rustix::fs::{Mode, OFlags, open};
++use rustix::fs::{Mode, OFlags, chown, open};
+ use rustix::process::setpgid;
+ use rustix::stdio::{dup2_stderr, dup2_stdin, dup2_stdout};
++use rustix::thread::{Gid, Uid};
+ use std::{
+     fs::{File, OpenOptions, create_dir_all, remove_file, write},
+     io::{
+@@ -189,14 +190,43 @@ fn link_ksud_to_bin() -> Result<()> {
+     Ok(())
+ }
+ 
+-pub fn install(libadbroot: Option<PathBuf>) -> Result<()> {
++pub fn stage_daemon() -> Result<()> {
++    ensure_dir_exists(defs::ADB_DIR)?;
++
++    let current_exe = std::env::current_exe().with_context(|| "Failed to get self exe path")?;
++    if current_exe == Path::new(defs::DAEMON_PATH) {
++        return Ok(());
++    }
++
++    let daemon = std::fs::read(&current_exe)
++        .with_context(|| format!("Failed to read {}", current_exe.display()))?;
++    std::fs::write(defs::DAEMON_PATH, daemon)
++        .with_context(|| format!("Failed to write {}", defs::DAEMON_PATH))?;
++    #[cfg(unix)]
++    set_permissions(defs::DAEMON_PATH, Permissions::from_mode(0o755))?;
++
++    Ok(())
++}
++
++pub fn stage_daemon_from(staged_exe: impl AsRef<Path>) -> Result<()> {
+     ensure_dir_exists(defs::ADB_DIR)?;
+-    let _ = std::fs::remove_file(defs::DAEMON_PATH);
+-    std::fs::copy(
+-        std::env::current_exe().with_context(|| "Failed to get self exe path")?,
+-        defs::DAEMON_PATH,
+-    )?;
+-    restorecon::lsetfilecon(defs::DAEMON_PATH, restorecon::ADB_CON)?;
++
++    std::fs::rename(staged_exe.as_ref(), defs::DAEMON_PATH).with_context(|| {
++        format!(
++            "Failed to rename {} to {}",
++            staged_exe.as_ref().display(),
++            defs::DAEMON_PATH
++        )
++    })?;
++    chown(defs::DAEMON_PATH, Some(Uid::ROOT), Some(Gid::ROOT))?;
++    #[cfg(unix)]
++    set_permissions(defs::DAEMON_PATH, Permissions::from_mode(0o755))?;
++
++    Ok(())
++}
++
++pub fn finish_install(libadbroot: Option<PathBuf>) -> Result<()> {
++    restorecon::lsetfilecon(defs::DAEMON_PATH, restorecon::KSU_CON)?;
+     // install binary assets
+     assets::ensure_binaries(false).with_context(|| "Failed to extract assets")?;
+ 
+@@ -211,6 +241,11 @@ pub fn install(libadbroot: Option<PathBuf>) -> Result<()> {
+     Ok(())
+ }
+ 
++pub fn install(libadbroot: Option<PathBuf>) -> Result<()> {
++    stage_daemon()?;
++    finish_install(libadbroot)
++}
++
+ pub fn uninstall(package_name: &str) -> Result<()> {
+     if Path::new(defs::MODULE_DIR).exists() {
+         println!("- Uninstall modules..");
+@@ -255,10 +290,6 @@ pub fn daemonize_with<F: FnOnce() -> Result<()>>(use_init_pgrp: bool, configure:
+     Ok(())
+ }
+ 
+-pub fn daemonize(use_init_pgrp: bool) -> Result<()> {
+-    daemonize_with(use_init_pgrp, || Ok(()))
+-}
+-
+ pub fn create_daemon(use_init_pgrp: bool) -> Result<bool> {
+     create_daemon_with(use_init_pgrp, || Ok(()))
+ }

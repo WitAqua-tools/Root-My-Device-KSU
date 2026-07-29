@@ -1,0 +1,21 @@
+diff --git a/kernel/Kbuild b/kernel/Kbuild
+index fd31bb51..505067fb 100644
+--- a/kernel/Kbuild
++++ b/kernel/Kbuild
+@@ -64,6 +64,7 @@ endif
+ endif
+ 
+ ccflags-y += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
++ccflags-y += -I$(objtree)/security/selinux -I$(objtree)/security/selinux/include
+ ccflags-y += -I$(objtree)/security/selinux -include $(srctree)/include/uapi/asm-generic/errno.h
+ 
+ ifeq ($(filter /%,$(src)),)
+@@ -72,7 +73,7 @@ else
+ KSU_KERNEL_DIR := $(src)
+ endif
+ 
+-ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include
++ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include -I$(KSU_KERNEL_DIR)/..
+ 
+ obj-$(CONFIG_KSU) += kernelsu.o
+ 
