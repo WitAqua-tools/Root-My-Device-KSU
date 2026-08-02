@@ -1,0 +1,36 @@
+diff --git a/kernel/hook/syscall_event_bridge.c b/kernel/hook/syscall_event_bridge.c
+--- a/kernel/hook/syscall_event_bridge.c
++++ b/kernel/hook/syscall_event_bridge.c
+@@ -36,10 +36,31 @@ static int ksu_handle_init_mark_tracker(const char __user **filename_user)
+         return 0;
+ 
+     path[sizeof(path) - 1] = '\0';
++    /*
++     * Upstream 953b403a, "kernel: prevent /system/bin/stub_zygote from being
++     * unmarked" -- in 32567, not in the 32525 the builds pin.
++     *
++     * Meta's Horizon OS does not exec the zygote directly. init runs
++     *
++     *     /system/bin/stub_zygote /system/bin/app_process64 -Xzygote ...
++     *
++     * and the stub spawns the real zygote as its child, so unmarking the stub
++     * unmarks the zygote and every application forked from it -- nothing those
++     * processes do reaches a KernelSU syscall hook at all.
++     *
++     * It survives a boot, because the module marks the running processes as it
++     * loads and the zygote is already up by then. It does not survive `ksud
++     * soft-reboot`: measured on Quest 3, the new zygote came back unmarked, no
++     * setresuid hook fired for any uid afterwards, and the manager's supercall
++     * -- which needs the seccomp hole that hook punches -- died with SIGSYS on
++     * syscall 142 every time the manager was started. `ksud debug mark refresh`
++     * restored all of it, which is what says the mark is the whole of it.
++     */
+     if (unlikely(strcmp(path, KSUD_PATH) == 0)) {
+         pr_info("hook_manager: escape to root for init executing ksud: %d\n", current->pid);
+         escape_to_root_for_init();
+-    } else if (likely(strstr(path, "/app_process") == NULL && strstr(path, "/adbd") == NULL)) {
++    } else if (likely(strstr(path, "/app_process") == NULL && strstr(path, "/adbd") == NULL &&
++                      strstr(path, "/stub_zygote") == NULL)) {
+         pr_info("hook_manager: unmark %d exec %s\n", current->pid, path);
+         ksu_clear_task_tracepoint_flag_if_needed(current);
+     }

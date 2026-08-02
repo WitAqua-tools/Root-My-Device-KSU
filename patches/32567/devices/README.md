@@ -15,6 +15,12 @@ use, so reach for it only after `common` and the vendor sets have been ruled
 out. As with any set, a `devices/<id>` with no patches in it fails the build
 that names it rather than being quietly skipped.
 
+Empty *here* for a reason worth writing down: the one delta the other two
+versions carry -- `quest3`, upstream `953b403a` for `/system/bin/stub_zygote` --
+is already in this version's tree. A build that names `devices/quest3` therefore
+fails at this pin instead of applying nothing, which is the reminder to drop the
+name from its `patchSets` when the pin moves here.
+
 These live here rather than beside the target in the consuming repository for
 the same reason the rest do: they are a derivative work of KernelSU and carry
 its licence, which is not the licence of the repository that builds them.

@@ -89,7 +89,7 @@ either always applied or named by the build that wants it:
 | `common/` | every build, always, first | what no target can boot without |
 | `galaxy/` | builds that name it | Samsung KDP / RKP / DEFEX |
 | `oppo/` | builds that name it | OPPO, OnePlus and realme — [empty today](patches/32525/oppo/README.md) |
-| `devices/<id>/` | the one build that names it | what nothing else can use — [empty today](patches/32525/devices/README.md) |
+| `devices/<id>/` | the one build that names it | what nothing else can use — [`quest3` today](patches/32525/devices/README.md) |
 
 Within a set the patches apply in filename order, hence the `NNNN-` prefixes.
 The sets apply in the order `common`, then whatever the build named, in the
