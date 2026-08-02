@@ -134,6 +134,19 @@ line naming the version, uapi, flags and features the module reports — evidenc
 that KernelSU is live which does not depend on descriptors the sepolicy reload
 takes away.
 
+`0004-reap-module-daemons-on-soft-reboot.patch` — an emulated soft reboot kills
+the daemons a module started before it runs the stage scripts again. Since
+`0003` the first cycle a module ever gets is a soft reboot, so every one after
+it meets daemons that a real reboot would have taken. Modules are meant to shut
+themselves down in the `emulated-soft-reboot` stage — Zygisk Next does — but
+most never implement it, and those go one of two ways: LSPosed exits on its
+single-instance lock and leaves the stale daemon holding the module directory
+that post-fs-data is about to replace, after which it cannot start its bridge
+into the new `system_server` at all; Sui starts a second daemon and leaves both.
+A process counts as a daemon to reap when its executable, working directory or
+any mapping is under `/data/adb/modules/`, and its process group goes with it
+unless that group is init's.
+
 ### `galaxy/`
 
 `0001-samsung-kdp-rkp-defex.patch` — a generic build panics on Samsung
