@@ -60,8 +60,19 @@ env:
   # way the APK is checked for them below rather than trusted to have them.
   MANAGER_PACKAGE: org.witaqua.pwn.kernelsu
   MANAGER_NAME: Root My Device KSU
-  EXPECTED_CERT_SHA256: a66068cd6cc875e8d43334d1bf70eadd0ab8ad6096d8d004e39e7b6a87cdf6f0
-  EXPECTED_CERT_SIZE: 1316
+  EXPECTED_CERT_SHA256: 892ea55bd3eeca03d97d52e73c3c16cb3e0ad13f571cdbce8394035249b57002
+  EXPECTED_CERT_SIZE: 804
+  # What the module can physically read. kernel/manager/apk_sign.c reads the
+  # certificate into a fixed buffer before hashing it:
+  #
+  #     #define CERT_MAX_LENGTH 1024
+  #     if (*size4 > CERT_MAX_LENGTH) { pr_info("cert length overlimit"); return false; }
+  #
+  # A longer certificate is not rejected loudly on a device -- is_manager stays
+  # 0 and nothing else is said. The first key here was RSA-4096, 1316 bytes,
+  # and no module ever recognised the manager it signed. Checked here so that
+  # cannot happen again in silence.
+  CERT_MAX_LENGTH: 1024
 
 jobs:
   manager:
@@ -220,22 +231,44 @@ jobs:
             echo "::error::labelled '$label', expected '$MANAGER_NAME'"; exit 1; }
 
       - name: Check the APK is signed with the certificate the modules trust
+        env:
+          STORE_FILE: ${{ secrets.STORE_FILE }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           set -euo pipefail
           apk=$(find dist -name '*.apk' -type f | head -n 1)
           test -n "$apk" || { echo "::error::repack produced no apk"; exit 1; }
           echo "apk: $apk"
 
-          got=$(apksigner verify --print-certs "$apk" \
-                | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
-          test -n "$got" || { echo "::error::no v2 signer on $apk"; exit 1; }
+          certs=$(apksigner verify --print-certs "$apk" 2>&1) || {
+            echo "$certs"; echo "::error::apksigner could not read $apk"; exit 1; }
+          got=$(sed -n 's/.*certificate SHA-256 digest: *//p' <<<"$certs" | head -1)
+          if [ -z "$got" ]; then
+            echo "$certs"; echo "::error::apksigner printed no certificate digest"; exit 1
+          fi
 
           if [ "$got" != "$EXPECTED_CERT_SHA256" ]; then
             echo "::error::signed with $got, but the modules are built to trust $EXPECTED_CERT_SHA256"
             echo "::error::either the wrong key is in the secrets, or every module carrying the old pair has to be rebuilt"
             exit 1
           fi
-          echo "certificate matches: $got (size $EXPECTED_CERT_SIZE, KSU_EXPECTED_*2 in the target's kernelsu.json)"
+
+          # The size is the other half of the pair, and the half with a ceiling.
+          # Read it off the key rather than trusting the number above.
+          printf '%s' "$STORE_FILE" | base64 -d > check.jks
+          keytool -exportcert -alias "$KEY_ALIAS" -keystore check.jks \
+            -storepass "$STORE_PASSWORD" -file cert.der 2>/dev/null
+          size=$(stat -c%s cert.der)
+          rm -f check.jks cert.der
+          echo "certificate: $got, $size bytes of DER"
+          [ "$size" = "$EXPECTED_CERT_SIZE" ] || {
+            echo "::error::the certificate is $size bytes, not $EXPECTED_CERT_SIZE"; exit 1; }
+          if [ "$size" -gt "$CERT_MAX_LENGTH" ]; then
+            echo "::error::$size bytes is past CERT_MAX_LENGTH ($CERT_MAX_LENGTH), so no module can"
+            echo "::error::read this certificate at all -- it would be is_manager: 0 and silence"
+            exit 1
+          fi
 
       - name: Verify the reap patch is in the bundled ksud
         run: |

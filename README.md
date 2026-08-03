@@ -225,9 +225,14 @@ fail silently on a device:
   upstream version — 32567 reads it from a gradle property, earlier ones have
   it hardcoded by the patch — so it is read back out of the built APK rather
   than assumed;
-- **the signing certificate** is the one the modules are built to look for. An
-  APK signed with anything else is not rejected, it is never found, and nothing
-  is logged either way;
+- **the signing certificate** is the one the modules are built to look for, and
+  **short enough for one to read**. An APK signed with anything else is not
+  rejected, it is never found, and nothing is logged either way — and a
+  certificate over `CERT_MAX_LENGTH` (1024 bytes of DER, `kernel/manager/apk_sign.c`)
+  goes the same way whatever the module is compiled to expect. The first key
+  used here was RSA-4096, 1316 bytes, and no module ever recognised the manager
+  it signed. It is RSA-2048 and 804 bytes now, and both numbers are read off
+  the key rather than trusted;
 - **the bundled `ksud` really carries the patches**, by a string only
   `common/0004` adds.
 
