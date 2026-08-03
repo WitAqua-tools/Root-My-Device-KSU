@@ -1,0 +1,15 @@
+diff --git a/manager/app/build.gradle.kts b/manager/app/build.gradle.kts
+index 0753aee2..8eadb5e5 100644
+--- a/manager/app/build.gradle.kts
++++ b/manager/app/build.gradle.kts
+@@ -20,8 +20,8 @@ val managerVersionCode = rootProject.extra["managerVersionCode"] as Int
+ val managerVersionName = rootProject.extra["managerVersionName"] as String
+ 
+ val isPrBuild = project.findProperty("IS_PR_BUILD")?.toString()?.toBoolean() ?: false
+-val defaultManagerPackageName = if (isPrBuild) "me.weishu.kernelsu.pr" else "me.weishu.kernelsu"
+-val defaultManagerName = if (isPrBuild) "KernelSU PR" else "KernelSU"
++val defaultManagerPackageName = if (isPrBuild) "org.witaqua.pwn.kernelsu.pr" else "org.witaqua.pwn.kernelsu"
++val defaultManagerName = if (isPrBuild) "Root My Device KSU PR" else "Root My Device KSU"
+ val managerPackageName = project.findProperty("KSU_PACKAGE_NAME")?.toString() ?: defaultManagerPackageName
+ val managerName = project.findProperty("KSU_NAME")?.toString() ?: defaultManagerName
+ 

@@ -1,0 +1,55 @@
+diff --git a/manager/app/build.gradle.kts b/manager/app/build.gradle.kts
+index 756eb303..f5bdf231 100644
+--- a/manager/app/build.gradle.kts
++++ b/manager/app/build.gradle.kts
+@@ -35,6 +35,7 @@ val baseCppFlags = baseCFlags + "-fno-rtti"
+ 
+ android {
+     namespace = "me.weishu.kernelsu"
++    applicationId = "org.witaqua.pwn.kernelsu"
+     val isPrBuild = project.findProperty("IS_PR_BUILD")?.toString()?.toBoolean() ?: false
+ 
+     buildTypes {
+diff --git a/manager/app/src/main/res/values/strings.xml b/manager/app/src/main/res/values/strings.xml
+index 3b37ffb2..bdf15148 100644
+--- a/manager/app/src/main/res/values/strings.xml
++++ b/manager/app/src/main/res/values/strings.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="app_name" translatable="false">KernelSU</string>
++    <string name="app_name" translatable="false">Root My Device KSU</string>
+     <string name="home">Home</string>
+     <string name="home_not_installed">Not installed</string>
+     <string name="home_click_to_install">Tap to install</string>
+diff --git a/userspace/ksud/src/cli.rs b/userspace/ksud/src/cli.rs
+index a4231583..b588c11c 100644
+--- a/userspace/ksud/src/cli.rs
++++ b/userspace/ksud/src/cli.rs
+@@ -60,7 +60,7 @@ enum Commands {
+         kmi: Option<String>,
+ 
+         /// manager package name
+-        #[arg(long, default_value_t = String::from("me.weishu.kernelsu"))]
++        #[arg(long, default_value_t = String::from("org.witaqua.pwn.kernelsu"))]
+         package_name: String,
+     },
+ 
+@@ -87,7 +87,7 @@ enum Commands {
+ 
+     /// Uninstall KernelSU modules and itself(LKM Only)
+     Uninstall {
+-        #[arg(long, default_value_t = String::from("me.weishu.kernelsu"))]
++        #[arg(long, default_value_t = String::from("org.witaqua.pwn.kernelsu"))]
+         package_name: String,
+     },
+ 
+@@ -176,7 +176,7 @@ enum Debug {
+     /// Set the manager app, kernel CONFIG_KSU_DEBUG should be enabled.
+     SetManager {
+         /// manager package name
+-        #[arg(default_value_t = String::from("me.weishu.kernelsu"))]
++        #[arg(default_value_t = String::from("org.witaqua.pwn.kernelsu"))]
+         apk: String,
+     },
+ 

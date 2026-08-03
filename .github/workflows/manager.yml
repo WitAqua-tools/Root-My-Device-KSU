@@ -55,6 +55,12 @@ permissions:
 # with nothing in the log to say why. Checked here rather than discovered on a
 # device.
 env:
+  # What the manager is called on the device. From 32567 upstream reads both
+  # from gradle properties and ksud from an environment variable; before that
+  # the patch set hardcodes them, and passing them anyway is harmless. Either
+  # way the APK is checked for them below rather than trusted to have them.
+  MANAGER_PACKAGE: org.witaqua.pwn.kernelsu
+  MANAGER_NAME: Root My Device KSU
   EXPECTED_CERT_SHA256: a66068cd6cc875e8d43334d1bf70eadd0ab8ad6096d8d004e39e7b6a87cdf6f0
   EXPECTED_CERT_SIZE: 1316
 
@@ -146,6 +152,7 @@ jobs:
       - name: Build the patched ksud
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          KSU_PACKAGE_NAME: ${{ env.MANAGER_PACKAGE }}
         run: |
           set -euo pipefail
           for triple in aarch64-linux-android x86_64-linux-android; do
@@ -174,7 +181,9 @@ jobs:
 
       - name: Build the manager
         working-directory: kernelsu/manager
-        run: ./gradlew clean assembleRelease
+        run: |
+          ./gradlew clean assembleRelease \
+            -PKSU_PACKAGE_NAME="$MANAGER_PACKAGE" -PKSU_NAME="$MANAGER_NAME"
 
       # Gradle's APK carries no ksud; repack_apk.py is what puts one in, which
       # is also how upstream produces the APK it releases.
@@ -189,7 +198,27 @@ jobs:
             -b release -t release \
             -a arm64-v8a -a x86_64 \
             -K key.jks -A "$KEY_ALIAS" -P "$STORE_PASSWORD" -S "$KEY_PASSWORD" \
-            -n "KernelSU_witaqua_${KSU_VERSION}"
+            -n "RootMyDeviceKSU_${KSU_VERSION}"
+
+      - name: Check the APK is the manager the modules look for
+        run: |
+          set -euo pipefail
+          apk=$(find dist -name '*.apk' -type f | head -n 1)
+          test -n "$apk" || { echo "::error::repack produced no apk"; exit 1; }
+          badging=$(aapt2 dump badging "$apk")
+          pkg=$(sed -n "s/^package: name='\\([^']*\\)'.*/\\1/p" <<<"$badging")
+          label=$(sed -n "s/^application-label:'\\([^']*\\)'.*/\\1/p" <<<"$badging")
+          echo "package: $pkg"
+          echo "label:   $label"
+          # The module is built with KSU_MANAGER_PACKAGE pinned to this, so an
+          # APK under any other name is not a manager as far as the kernel is
+          # concerned -- and the patch set that renames it differs by upstream
+          # version, which is exactly the kind of thing to check rather than
+          # assume.
+          [ "$pkg" = "$MANAGER_PACKAGE" ] || {
+            echo "::error::built as $pkg, but the modules only accept $MANAGER_PACKAGE"; exit 1; }
+          [ "$label" = "$MANAGER_NAME" ] || {
+            echo "::error::labelled '$label', expected '$MANAGER_NAME'"; exit 1; }
 
       - name: Check the APK is signed with the certificate the modules trust
         run: |
@@ -238,17 +267,18 @@ jobs:
 
           cat > notes.md <<NOTES
           Upstream KernelSU $KSU_VERSION with this repository's \`common\` patch
-          set applied to ksud, signed with the WitAqua key.
+          set applied to ksud, renamed to **$MANAGER_NAME**
+          (\`$MANAGER_PACKAGE\`) and signed with the WitAqua key.
 
           Its bundled ksud is the point: opening the official manager rewrites
           \`/data/adb/ksud\` with the copy inside its own APK, which reverts
           those patches on a device Root-My-Device rooted.
 
-          A module recognises this manager only if it was built with this
-          certificate in one of its two slots -- \`KSU_EXPECTED_SIZE2\` /
-          \`KSU_EXPECTED_HASH2\`, recorded in the target's \`kernelsu.json\` in
-          Root-My-Device-Payloads. It cannot be installed over the official
-          manager; that one has to be uninstalled first.
+          **This is the only manager the modules accept.** They are built with
+          this certificate as the one they look for and with the package name
+          above pinned, so the official manager is not rejected on such a
+          device -- it is never found. Both can be installed at once; only this
+          one is a manager.
           NOTES
           sed -i 's/^          //' notes.md
 
