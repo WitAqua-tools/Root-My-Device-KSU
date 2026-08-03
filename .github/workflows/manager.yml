@@ -1,0 +1,258 @@
+name: Manager
+
+# The KernelSU manager, built with the patches in this repository applied to
+# ksud and signed with the WitAqua key.
+#
+# Why it exists: the manager rewrites /data/adb/ksud with the copy bundled in
+# its own APK the first time it runs. On a device rooted by Root-My-Device that
+# silently reverts the patches in ksud -- measured on Quest 3, where opening the
+# official manager undid the soft-reboot module-daemon reap and the next soft
+# restart went back to leaving stale daemons behind. A manager whose bundled
+# ksud is already the patched one is what makes the patch survive the manager.
+#
+# It is built here because the patches are here. Nothing is forked: upstream is
+# checked out at the revision the patches were written against and they are
+# applied to the working tree, the same way Root-My-Device-Payloads builds a
+# module, so:
+#
+#   - `git apply --check` fails the build if the tree is not that revision;
+#   - `git rev-list --count HEAD` is untouched, so the manager's versionCode is
+#     the upstream one and matches the module Root-My-Device-Payloads builds.
+#
+# The bundled ksud carries no LKM. Root-My-Device loads the module with its own
+# ksud, and the DDK-built module upstream ships would not load on Quest 3
+# anyway. This manager is here to keep the daemon on the device patched, not to
+# install KernelSU.
+#
+# A push to main that touches the common set or this file builds and checks.
+# Only a hand-started run with the box ticked publishes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: KernelSU revision to build, and the one the patches must apply to
+        required: true
+        default: b0bc817b4e966aa6aa830834eaf6ef765d821d40
+      release:
+        description: publish a GitHub release as well as an artifact
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - patches/*/common/**
+      - .github/workflows/manager.yml
+
+permissions:
+  contents: read
+
+# The certificate the modules are built to trust, from
+# Android-Keys/kernelsu-manager. KernelSU's module picks its manager by hashing
+# the APK's v2 signing certificate and comparing it against EXPECTED_SIZE /
+# EXPECTED_HASH compiled in, so an APK signed with anything else is not a
+# manager as far as the kernel is concerned -- it just fails to be recognised,
+# with nothing in the log to say why. Checked here rather than discovered on a
+# device.
+env:
+  EXPECTED_CERT_SHA256: a66068cd6cc875e8d43334d1bf70eadd0ab8ad6096d8d004e39e7b6a87cdf6f0
+  EXPECTED_CERT_SIZE: 1316
+
+jobs:
+  manager:
+    runs-on: ubuntu-latest
+    # Only for the release step; the rest of the run needs nothing but a
+    # checkout.
+    permissions:
+      contents: write
+    # Everything after the two checkouts happens in the KernelSU tree: its
+    # gradle project, its repack script, its cargo workspace.
+    defaults:
+      run:
+        working-directory: kernelsu
+    steps:
+      - name: Check out the patch sets
+        uses: actions/checkout@v6
+        with:
+          path: patches-repo
+
+      - name: Check out KernelSU at the revision the patches were written against
+        uses: actions/checkout@v6
+        with:
+          repository: tiann/KernelSU
+          ref: ${{ inputs.ksu_ref || 'b0bc817b4e966aa6aa830834eaf6ef765d821d40' }}
+          path: kernelsu
+          fetch-depth: 0
+
+      - name: Apply the common patch set
+        run: |
+          set -euo pipefail
+          # The directory is derived from the checked-out tree, never named
+          # here, so a revision with no set fails instead of taking one written
+          # against another tree.
+          version=$((30000 + $(git rev-list --count HEAD)))
+          echo "KernelSU version: $version"
+          echo "KSU_VERSION=$version" >> "$GITHUB_ENV"
+
+          # common only, in filename order, the same way Root-My-Device-Payloads
+          # applies it. The sets a target names on top of it are kernel-side --
+          # devices/quest3 patches the module, not ksud -- so a manager built
+          # from common alone carries the same daemon every target's build does.
+          # A userspace patch that ever lands in a non-common set breaks that,
+          # and this is where to notice.
+          set_dir="$GITHUB_WORKSPACE/patches-repo/patches/$version/common"
+          test -d "$set_dir" || { echo "::error::no patch set at patches/$version/common"; exit 1; }
+
+          shopt -s nullglob
+          patches=("$set_dir"/*.patch)
+          test ${#patches[@]} -gt 0 || { echo "::error::patches/$version/common has no patches"; exit 1; }
+
+          for p in "${patches[@]}"; do
+            echo "-- $(basename "$p")"
+            git apply --check "$p"
+            git apply "$p"
+          done
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up build-tools
+        run: |
+          sdkmanager "build-tools;35.0.0"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      - name: Set up Rust
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kernelsu/userspace/ksud
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r29
+
+      - name: Build the patched ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          for triple in aarch64-linux-android x86_64-linux-android; do
+            # shellcheck disable=SC1091
+            source .github/scripts/setup-rust-build.sh "$triple" 26
+            cargo build --target "$triple" --release \
+              --manifest-path ./userspace/ksud/Cargo.toml
+          done
+
+      - name: Write the signing key
+        env:
+          STORE_FILE: ${{ secrets.STORE_FILE }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$STORE_FILE" || { echo "::error::STORE_FILE is not set"; exit 1; }
+          printf '%s' "$STORE_FILE" | base64 -d > key.jks
+          {
+            echo "KEYSTORE_FILE=$PWD/key.jks"
+            echo "KEYSTORE_PASSWORD=$STORE_PASSWORD"
+            echo "KEY_ALIAS=$KEY_ALIAS"
+            echo "KEY_PASSWORD=$KEY_PASSWORD"
+          } >> manager/gradle.properties
+
+      - name: Build the manager
+        working-directory: kernelsu/manager
+        run: ./gradlew clean assembleRelease
+
+      # Gradle's APK carries no ksud; repack_apk.py is what puts one in, which
+      # is also how upstream produces the APK it releases.
+      - name: Repack with the patched ksud and re-sign
+        env:
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 repack_apk.py repack \
+            -b release -t release \
+            -a arm64-v8a -a x86_64 \
+            -K key.jks -A "$KEY_ALIAS" -P "$STORE_PASSWORD" -S "$KEY_PASSWORD" \
+            -n "KernelSU_witaqua_${KSU_VERSION}"
+
+      - name: Check the APK is signed with the certificate the modules trust
+        run: |
+          set -euo pipefail
+          apk=$(find dist -name '*.apk' -type f | head -n 1)
+          test -n "$apk" || { echo "::error::repack produced no apk"; exit 1; }
+          echo "apk: $apk"
+
+          got=$(apksigner verify --print-certs "$apk" \
+                | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          test -n "$got" || { echo "::error::no v2 signer on $apk"; exit 1; }
+
+          if [ "$got" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::signed with $got, but the modules are built to trust $EXPECTED_CERT_SHA256"
+            echo "::error::either the wrong key is in the secrets, or every module carrying the old pair has to be rebuilt"
+            exit 1
+          fi
+          echo "certificate matches: $got (size $EXPECTED_CERT_SIZE, KSU_EXPECTED_*2 in the target's kernelsu.json)"
+
+      - name: Verify the reap patch is in the bundled ksud
+        run: |
+          set -euo pipefail
+          # Cheap proof that the APK really carries the patched daemon rather
+          # than an upstream one: the string only this patch adds.
+          if ! grep -qa 'leftover module daemon' target/aarch64-linux-android/release/ksud; then
+            echo "::error::the built ksud does not carry common/0004; the patch set did not land"
+            exit 1
+          fi
+          echo "ksud carries the soft-reboot reaper"
+
+      - name: Upload the manager
+        uses: actions/upload-artifact@v7
+        with:
+          name: manager-witaqua-${{ env.KSU_VERSION }}
+          path: kernelsu/dist/*.apk
+
+      - name: Publish a release
+        if: ${{ inputs.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # HEAD is the KernelSU checkout, so the sha in the tag is
+          # upstream's revision and not a commit in this repository.
+          tag="manager-${KSU_VERSION}-$(git rev-parse --short HEAD)"
+
+          cat > notes.md <<NOTES
+          Upstream KernelSU $KSU_VERSION with this repository's \`common\` patch
+          set applied to ksud, signed with the WitAqua key.
+
+          Its bundled ksud is the point: opening the official manager rewrites
+          \`/data/adb/ksud\` with the copy inside its own APK, which reverts
+          those patches on a device Root-My-Device rooted.
+
+          A module recognises this manager only if it was built with this
+          certificate in one of its two slots -- \`KSU_EXPECTED_SIZE2\` /
+          \`KSU_EXPECTED_HASH2\`, recorded in the target's \`kernelsu.json\` in
+          Root-My-Device-Payloads. It cannot be installed over the official
+          manager; that one has to be uninstalled first.
+          NOTES
+          sed -i 's/^          //' notes.md
+
+          gh release create "$tag" dist/*.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "KernelSU manager $KSU_VERSION (WitAqua)" \
+            --notes-file notes.md
