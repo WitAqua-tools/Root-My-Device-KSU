@@ -1,15 +1,15 @@
 diff --git a/manager/app/build.gradle.kts b/manager/app/build.gradle.kts
-index 756eb303..f5bdf231 100644
+index 756eb303..0aa57cec 100644
 --- a/manager/app/build.gradle.kts
 +++ b/manager/app/build.gradle.kts
-@@ -35,6 +35,7 @@ val baseCppFlags = baseCFlags + "-fno-rtti"
+@@ -116,6 +116,7 @@ android {
+     ndkVersion = androidCompileNdkVersion
  
- android {
-     namespace = "me.weishu.kernelsu"
-+    applicationId = "org.witaqua.pwn.kernelsu"
-     val isPrBuild = project.findProperty("IS_PR_BUILD")?.toString()?.toBoolean() ?: false
- 
-     buildTypes {
+     defaultConfig {
++        applicationId = "org.witaqua.pwn.kernelsu"
+         minSdk = androidMinSdkVersion
+         targetSdk = androidTargetSdkVersion
+         versionCode = managerVersionCode
 diff --git a/manager/app/src/main/res/values/strings.xml b/manager/app/src/main/res/values/strings.xml
 index 3b37ffb2..bdf15148 100644
 --- a/manager/app/src/main/res/values/strings.xml
