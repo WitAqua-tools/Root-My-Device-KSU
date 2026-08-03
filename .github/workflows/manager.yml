@@ -24,8 +24,12 @@ name: Manager
 # anyway. This manager is here to keep the daemon on the device patched, not to
 # install KernelSU.
 #
-# A push to main that touches the common set or this file builds and checks.
-# Only a hand-started run with the box ticked publishes.
+# Hand-started only, and it publishes only with the box ticked. Leaving the box
+# alone is the check -- it builds the manager and runs every assertion on it
+# without publishing anything, which is what to do after changing a common
+# patch. Nothing runs it on a push: the APK a push produced was thrown away,
+# and a patch that lands is followed by a release run anyway, so it was
+# building the same thing twice.
 
 on:
   workflow_dispatch:
@@ -38,11 +42,6 @@ on:
         description: publish a GitHub release as well as an artifact
         type: boolean
         default: false
-  push:
-    branches: [main]
-    paths:
-      - patches/*/common/**
-      - .github/workflows/manager.yml
 
 permissions:
   contents: read
@@ -255,6 +254,9 @@ jobs:
           name: manager-witaqua-${{ env.KSU_VERSION }}
           path: kernelsu/dist/*.apk
 
+      # Everything above has run and passed by now, so what this adds is only
+      # the decision to publish -- which is a person's, because the target's
+      # kernelsu.json sends people here to install it.
       - name: Publish a release
         if: ${{ inputs.release }}
         env:

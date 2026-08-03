@@ -231,10 +231,16 @@ fail silently on a device:
 - **the bundled `ksud` really carries the patches**, by a string only
   `common/0004` adds.
 
-A push to `main` touching `patches/*/common/**` or the workflow builds and
-checks — but it always builds the pinned version, so a green run after an edit
-to some *other* version's `common/` says nothing about that version. To check
-one, run the workflow by hand with its revision as `ksu_ref`. Publishing a release is a hand-started run with the box ticked. The
+**Nothing runs it on a push.** Start it from the Actions tab; leaving the
+release box alone is the check, since it builds the manager and runs every
+assertion above without publishing anything. That is what to do after changing
+a `common` patch, and it is also why a push trigger would be waste — the APK a
+push produced was thrown away, and a patch that lands is followed by a release
+run anyway.
+
+It builds whatever `ksu_ref` says, defaulting to the pinned revision. A run
+after editing some *other* version's `common/` therefore says nothing about
+that version unless its revision is passed. Publishing a release is a hand-started run with the box ticked. The
 signing key lives in the private `Android-Keys` repository and reaches the
 build as repository secrets; it is not in this tree.
 
