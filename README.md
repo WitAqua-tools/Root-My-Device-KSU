@@ -4,11 +4,12 @@ Source patches against [KernelSU](https://github.com/tiann/KernelSU), kept in
 their own repository so that they carry KernelSU's licence rather than the
 Apache-2.0 licence of the projects that consume them.
 
-This repository holds **source only**. It builds nothing; the modules and
-`ksud` binaries are built by
+The kernel modules and the per-target `ksud` binaries are built by
 [Root-My-Device-Payloads](https://github.com/Witaqua-tools/Root-My-Device-Payloads),
-which pins the upstream KernelSU submodule and holds the per-target build
-definitions.
+which pins this repository and upstream KernelSU as submodules and holds the
+per-target build definitions. The one thing built **here** is the
+[manager](#manager), because what makes it ours is the patches, and they are
+here.
 
 ## Upstream
 
@@ -75,6 +76,13 @@ upstream file it modifies, whichever patch file it happens to sit in:
 Both licence files are verbatim copies of the corresponding files in the
 upstream tree at the pinned commit. Nothing here is relicensed, and no
 Apache-2.0 terms apply to any file in this repository.
+
+`.github/` is not derived from KernelSU — it is a build definition written here
+— and is covered by this repository's [`LICENSE`](LICENSE), the same GPL-3.0 as
+the `userspace/**` hunks, so the repository carries one licence for its own
+work rather than a third file. What that workflow builds is upstream KernelSU
+with the patches applied and carries KernelSU's terms, as it would if it were
+built by hand.
 
 ## Layout
 
@@ -168,6 +176,45 @@ DDK it does not compile — `compat/samsung_kdp.c` calls `task_pid_nr()` without
 the declaration that kernel's headers do not reach transitively. That is true
 of all three versions here, including the one none of this restructuring
 touched, so it is a property of the set and not of a rebase.
+
+## Manager
+
+The KernelSU manager **rewrites `/data/adb/ksud` with the copy bundled in its
+own APK the first time it runs**. On a device Root-My-Device rooted that
+silently reverts the patches in `ksud` — measured on Quest 3, where opening the
+official manager undid `common/0004` and the next soft restart went back to
+leaving stale daemons behind, with nothing in any log to say the daemon had
+been replaced. A soft restart is the only restart such a device has, so that is
+the normal path rather than a corner case.
+
+The **Manager** workflow builds one whose bundled `ksud` is already the patched
+one. It checks out upstream at the revision the patches were written against,
+applies `common` to the working tree, builds `ksud` for `aarch64` and `x86_64`,
+lets Gradle build the APK and `repack_apk.py` put that `ksud` into it, and
+signs the result. Nothing is forked and nothing is committed on top of
+upstream, so `git rev-list --count HEAD` is still upstream's and the manager's
+`versionCode` matches the module Root-My-Device-Payloads builds.
+
+Only `common` goes in. The sets a target names on top of it are kernel-side, so
+a manager built from `common` alone carries the same daemon every target's
+build does; a userspace patch landing in a non-common set would break that, and
+the workflow is where to notice.
+
+Two things are checked before the APK is worth anything, because both fail
+silently on a device:
+
+- **the signing certificate** is the one the modules are built to trust.
+  KernelSU picks its manager by hashing the APK's v2 certificate against a size
+  and hash compiled into the module (`KSU_EXPECTED_SIZE2` /
+  `KSU_EXPECTED_HASH2`, recorded in the target's `kernelsu.json`). An APK signed
+  with anything else is not rejected — it is never found, and nothing is logged;
+- **the bundled `ksud` really carries the patches**, by a string only
+  `common/0004` adds.
+
+A push to `main` touching `patches/*/common/**` or the workflow builds and
+checks. Publishing a release is a hand-started run with the box ticked. The
+signing key lives in the private `Android-Keys` repository and reaches the
+build as repository secrets; it is not in this tree.
 
 ## Applying by hand
 
