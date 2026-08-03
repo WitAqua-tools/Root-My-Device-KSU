@@ -261,9 +261,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # HEAD is the KernelSU checkout, so the sha in the tag is
-          # upstream's revision and not a commit in this repository.
-          tag="manager-${KSU_VERSION}-$(git rev-parse --short HEAD)"
+          # This repository's sha, not the KernelSU checkout's. The version
+          # already says which upstream revision this is, and the upstream sha
+          # does not move when the patches do -- a second release of the same
+          # version would collide with the first, which is how this was found.
+          tag="manager-${KSU_VERSION}-${GITHUB_SHA::7}"
 
           cat > notes.md <<NOTES
           Upstream KernelSU $KSU_VERSION with this repository's \`common\` patch
