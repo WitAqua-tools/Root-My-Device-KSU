@@ -212,7 +212,9 @@ silently on a device:
   `common/0004` adds.
 
 A push to `main` touching `patches/*/common/**` or the workflow builds and
-checks. Publishing a release is a hand-started run with the box ticked. The
+checks — but it always builds the pinned version, so a green run after an edit
+to some *other* version's `common/` says nothing about that version. To check
+one, run the workflow by hand with its revision as `ksu_ref`. Publishing a release is a hand-started run with the box ticked. The
 signing key lives in the private `Android-Keys` repository and reaches the
 build as repository secrets; it is not in this tree.
 
