@@ -155,6 +155,15 @@ A process counts as a daemon to reap when its executable, working directory or
 any mapping is under `/data/adb/modules/`, and its process group goes with it
 unless that group is init's.
 
+`0005-rebrand-the-manager.patch` — the manager is built here and is the only
+one the modules accept, so it is named accordingly: `Root My Device KSU`,
+`org.witaqua.pwn.kernelsu`. It is in `common/` rather than beside the manager
+build because `ksud` carries the same name as the package it launches and
+manages, and every target ships a `ksud` — a rename in one and not the other
+gives a daemon that force-stops and starts a package that is not there. From
+32567 upstream has properties for both and the patch only moves their defaults;
+before that it edits the three places that spell it out.
+
 ### `galaxy/`
 
 `0001-samsung-kdp-rkp-defex.patch` — a generic build panics on Samsung
@@ -188,8 +197,10 @@ been replaced. A soft restart is the only restart such a device has, so that is
 the normal path rather than a corner case.
 
 The **Manager** workflow builds one whose bundled `ksud` is already the patched
-one. It checks out upstream at the revision the patches were written against,
-applies `common` to the working tree, builds `ksud` for `aarch64` and `x86_64`,
+one, under a name of its own — **Root My Device KSU**,
+`org.witaqua.pwn.kernelsu`. It checks out upstream at the revision the patches
+were written against, applies `common` to the working tree, builds `ksud` for
+`aarch64` and `x86_64`,
 lets Gradle build the APK and `repack_apk.py` put that `ksud` into it, and
 signs the result. Nothing is forked and nothing is committed on top of
 upstream, so `git rev-list --count HEAD` is still upstream's and the manager's
@@ -200,14 +211,23 @@ a manager built from `common` alone carries the same daemon every target's
 build does; a userspace patch landing in a non-common set would break that, and
 the workflow is where to notice.
 
-Two things are checked before the APK is worth anything, because both fail
-silently on a device:
+**It is the only manager the modules accept.** Root-My-Device-Payloads builds
+them with this certificate as `KSU_EXPECTED_HASH` — upstream's default,
+replaced rather than added to — and with `KSU_MANAGER_PACKAGE` pinned to the
+name above. The official manager is not refused on such a device; it is never
+found, which is the point: it cannot rewrite `/data/adb/ksud` if the kernel
+does not consider it a manager. Both can be installed at once.
 
-- **the signing certificate** is the one the modules are built to trust.
-  KernelSU picks its manager by hashing the APK's v2 certificate against a size
-  and hash compiled into the module (`KSU_EXPECTED_SIZE2` /
-  `KSU_EXPECTED_HASH2`, recorded in the target's `kernelsu.json`). An APK signed
-  with anything else is not rejected — it is never found, and nothing is logged;
+Three things are checked before the APK is worth anything, because all three
+fail silently on a device:
+
+- **the package name and the label** are the ones above. The rename differs by
+  upstream version — 32567 reads it from a gradle property, earlier ones have
+  it hardcoded by the patch — so it is read back out of the built APK rather
+  than assumed;
+- **the signing certificate** is the one the modules are built to look for. An
+  APK signed with anything else is not rejected, it is never found, and nothing
+  is logged either way;
 - **the bundled `ksud` really carries the patches**, by a string only
   `common/0004` adds.
 
