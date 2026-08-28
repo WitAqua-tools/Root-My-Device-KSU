@@ -1,0 +1,427 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -3,11 +3,288 @@
+ use rustix::cstr;
+-use std::fs;
++use std::fs::{self, OpenOptions};
++use std::io::Write;
+ use std::os::unix::fs::PermissionsExt;
+-use std::process::Command;
++use std::path::Path;
++use std::process::{Command, Stdio};
+ use std::thread;
+ use std::time::Duration;
+-
++
+ use crate::module::{handle_updated_modules, prune_modules};
+ use crate::{assets, defs, init_event, metamodule, restorecon, utils};
+-
++
++const VECTOR_DIR: &str = "/data/adb/modules/zygisk_vector";
++const VECTOR_SOCKET: &str = "/data/adb/lspd/.cli_sock";
++const VECTOR_SERVICE_LOG: &str = "/data/local/tmp/root-my-nothing-vector-service.log";
++const MODULE_LIFECYCLE_LOG: &str = "/data/local/tmp/root-my-nothing-modules.log";
++const VECTOR_SERVICE_MARKER: &str = "RMN_ASTEROIDS_VECTOR_SERVICE_V2";
++const VECTOR_AUDITED_SERVICE: &str = r#"#!/system/bin/sh
++# RMN_ASTEROIDS_VECTOR_SERVICE_V2
++MODDIR="${0%/*}"
++cd "$MODDIR" || exit 1
++
++# Vector's stock script requests util-linux `--propagation slave`. Android's
++# /system/bin/unshare supports a mount namespace but not that option, so set
++# recursive-slave propagation from inside the new namespace. Use absolute
++# Android tools: KernelSU module scripts otherwise run in a BusyBox ash
++# environment where bare applet resolution is not equivalent.
++#
++# There is deliberately no trailing `&`. The Asteroids late-load path keeps
++# the child handle and monitors it until Vector registers its root socket.
++exec /system/bin/unshare -m /system/bin/sh -c '
++    /system/bin/mount -o rslave none / || exit 1
++    DAEMON="$1"
++    shift
++    exec "$DAEMON" --system-server-max-retry=3 "$@"
++' sh "$MODDIR/daemon" "$@"
++"#;
++
++#[derive(Clone, Copy)]
++enum VectorServiceState {
++    Disabled,
++    Running,
++    NeedsLaunch,
++}
++
++fn reset_module_lifecycle_log() {
++    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
++        .unwrap_or_else(|_| "unknown".to_string());
++    if let Err(error) = fs::write(
++        MODULE_LIFECYCLE_LOG,
++        format!("boot_id={} pid={}\n", boot_id.trim(), std::process::id()),
++    ) {
++        warn!("Asteroids late-load: failed to reset module lifecycle log: {error}");
++        return;
++    }
++    if let Ok(metadata) = fs::metadata(MODULE_LIFECYCLE_LOG) {
++        let mut permissions = metadata.permissions();
++        permissions.set_mode(0o644);
++        if let Err(error) = fs::set_permissions(MODULE_LIFECYCLE_LOG, permissions) {
++            warn!("Asteroids late-load: failed to chmod module lifecycle log: {error}");
++        }
++    }
++}
++
++fn append_module_lifecycle_log(message: &str) {
++    match OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open(MODULE_LIFECYCLE_LOG)
++    {
++        Ok(mut file) => {
++            if let Err(error) = writeln!(file, "{message}") {
++                warn!("Asteroids late-load: failed to write module lifecycle log: {error}");
++            }
++        }
++        Err(error) => {
++            warn!("Asteroids late-load: failed to open module lifecycle log: {error}");
++        }
++    }
++}
++
++fn ensure_zygote_boundary_after_services(previous_system_server: Option<&String>) -> Result<()> {
++    // NeoZygisk and Vector can recreate zygote themselves. Give an already
++    // launched service a bounded grace period and avoid issuing a second
++    // ctl.restart while the first framework restart is still converging.
++    for _ in 0..24 {
++        let current_system_server = process_id("system_server");
++        let replaced = current_system_server.is_some()
++            && current_system_server.as_ref() != previous_system_server;
++        let zygote_running = utils::getprop("init.svc.zygote").as_deref() == Some("running");
++        if replaced && zygote_running {
++            let message = format!(
++                "service stage already recreated zygote/system_server ({previous_system_server:?} -> {current_system_server:?})"
++            );
++            info!("Asteroids late-load: {message}");
++            append_module_lifecycle_log(&message);
++            thread::sleep(Duration::from_millis(500));
++            return Ok(());
++        }
++        thread::sleep(Duration::from_millis(250));
++    }
++
++    append_module_lifecycle_log("service stage did not restart zygote; requesting one restart");
++    restart_zygote_for_late_modules()
++}
++
++fn vector_module_enabled() -> bool {
++    let module_dir = Path::new(VECTOR_DIR);
++    module_dir.is_dir()
++        && !module_dir.join("disable").exists()
++        && !module_dir.join("remove").exists()
++        && module_dir.join("service.sh").is_file()
++        && module_dir.join("daemon").is_file()
++}
++
++fn patch_vector_service_for_android_tools() -> Result<()> {
++    let service_path = Path::new(VECTOR_DIR).join("service.sh");
++    let service = fs::read_to_string(&service_path).context("failed to read Vector service.sh")?;
++
++    if service.contains(VECTOR_SERVICE_MARKER) {
++        info!("Asteroids late-load: Vector service launcher already audited");
++        return Ok(());
++    }
++
++    // Preserve the installed vendor script once. Replace every older RMN
++    // variant: the failed variants used util-linux-only --propagation syntax,
++    // bare BusyBox applets, nested su, or an extra background process.
++    let backup_path = Path::new(VECTOR_DIR).join("service.sh.rmn-stock");
++    if !backup_path.exists() {
++        fs::copy(&service_path, &backup_path).context("failed to back up Vector service.sh")?;
++    }
++
++    fs::write(&service_path, VECTOR_AUDITED_SERVICE)
++        .context("failed to install audited Vector service.sh")?;
++    let mut perms = fs::metadata(&service_path)?.permissions();
++    perms.set_mode(0o755);
++    fs::set_permissions(&service_path, perms)?;
++    info!("Asteroids late-load: Vector service launcher installed with absolute Android tools");
++    Ok(())
++}
++
++fn vector_socket_registered() -> bool {
++    fs::read_to_string("/proc/net/unix")
++        .map(|table| table.lines().any(|line| line.contains(VECTOR_SOCKET)))
++        .unwrap_or(false)
++}
++
++fn stop_stale_vector_launcher() {
++    let Ok(entries) = fs::read_dir("/proc") else {
++        return;
++    };
++    for entry in entries.flatten() {
++        let Some(pid) = entry
++            .file_name()
++            .to_str()
++            .and_then(|s| s.parse::<u32>().ok())
++        else {
++            continue;
++        };
++        let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
++        if !String::from_utf8_lossy(&cmdline).contains("/data/adb/modules/zygisk_vector/daemon") {
++            continue;
++        }
++        warn!("Asteroids late-load: stopping stale Vector launcher pid={pid}");
++        match Command::new("/system/bin/kill")
++            .args(["-9", &pid.to_string()])
++            .status()
++        {
++            Ok(status) if status.success() => {}
++            Ok(status) => warn!("Asteroids late-load: kill pid={pid} exited {status}"),
++            Err(err) => warn!("Asteroids late-load: kill pid={pid} failed: {err}"),
++        }
++    }
++}
++
++fn prepare_vector_service_stage() -> Result<VectorServiceState> {
++    if !vector_module_enabled() {
++        info!("Asteroids late-load: Vector lifecycle skipped: module unavailable or disabled");
++        return Ok(VectorServiceState::Disabled);
++    }
++    patch_vector_service_for_android_tools()?;
++
++    // A registered kernel socket belongs to a live daemon. Preserve it on a
++    // module-only retry and exclude Vector from generic service dispatch so
++    // the retry cannot create a duplicate daemon.
++    if vector_socket_registered() {
++        info!("Asteroids late-load: existing Vector root daemon socket is registered");
++        return Ok(VectorServiceState::Running);
++    }
++    stop_stale_vector_launcher();
++    if Path::new(VECTOR_SOCKET).exists() {
++        warn!("Asteroids late-load: removing stale Vector CLI socket inode");
++        fs::remove_file(VECTOR_SOCKET).context("failed to remove stale Vector CLI socket inode")?;
++    }
++    info!("Asteroids late-load: Vector prepared for one monitored direct service launch");
++    Ok(VectorServiceState::NeedsLaunch)
++}
++
++fn wait_vector_root_daemon(attempts: usize) -> bool {
++    for _ in 0..attempts {
++        if vector_socket_registered() {
++            info!("Asteroids late-load: Vector root daemon socket registered");
++            return true;
++        }
++        thread::sleep(Duration::from_millis(100));
++    }
++    false
++}
++
++fn launch_vector_service_directly() -> Result<()> {
++    let service_path = Path::new(VECTOR_DIR).join("service.sh");
++    info!(
++        "Asteroids late-load: launching Vector directly with /system/bin/sh ({}) log={}",
++        service_path.display(),
++        VECTOR_SERVICE_LOG
++    );
++    let stdout = fs::File::create(VECTOR_SERVICE_LOG)
++        .context("failed to create Vector service launcher log")?;
++    let stderr = stdout
++        .try_clone()
++        .context("failed to clone Vector service launcher log")?;
++    let mut child = Command::new("/system/bin/sh")
++        .arg(&service_path)
++        .stdout(Stdio::from(stdout))
++        .stderr(Stdio::from(stderr))
++        .spawn()
++        .context("failed to spawn monitored Vector service launcher")?;
++
++    for _ in 0..150 {
++        if vector_socket_registered() {
++            info!(
++                "Asteroids late-load: monitored Vector launcher registered {} (pid={})",
++                VECTOR_SOCKET,
++                child.id()
++            );
++            return Ok(());
++        }
++        if let Some(status) = child
++            .try_wait()
++            .context("failed to query monitored Vector service launcher")?
++        {
++            anyhow::bail!(
++                "Vector service launcher exited {status} before registering {VECTOR_SOCKET}; see {VECTOR_SERVICE_LOG}"
++            );
++        }
++        thread::sleep(Duration::from_millis(100));
++    }
++
++    anyhow::bail!(
++        "Vector service launcher pid={} did not register {} within 15 seconds (inode_exists={}); see {}",
++        child.id(),
++        VECTOR_SOCKET,
++        Path::new(VECTOR_SOCKET).exists(),
++        VECTOR_SERVICE_LOG
++    )
++}
++
++fn verify_vector_framework_cli() -> Result<()> {
++    let cli_path = Path::new(VECTOR_DIR).join("cli");
++    anyhow::ensure!(
++        cli_path.is_file(),
++        "Vector CLI is missing: {}",
++        cli_path.display()
++    );
++    let output = Command::new("/system/bin/sh")
++        .arg(&cli_path)
++        .args(["--json", "status"])
++        .output()
++        .context("failed to execute Vector CLI health status")?;
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    anyhow::ensure!(
++        output.status.success(),
++        "Vector CLI status exited {}: {}",
++        output.status,
++        stderr.trim()
++    );
++    anyhow::ensure!(
++        stdout.contains("\"success\": true") && stdout.contains("\"Framework Version\""),
++        "Vector CLI did not report a healthy framework: {}",
++        stdout.trim()
++    );
++    info!("Asteroids late-load: Vector CLI framework health verified");
++    append_module_lifecycle_log("Vector CLI framework health verified");
++    Ok(())
++}
++
+ fn process_id(name: &str) -> Option<String> {
+@@ -258,7 +535,43 @@
+     // already running. Give non-blocking service scripts a short head start,
+     // then recreate the zygote-start boundary.
+     if run_module_scripts {
++        reset_module_lifecycle_log();
++        let service_result = (|| -> Result<()> {
++            let previous_system_server = process_id("system_server");
++            append_module_lifecycle_log(&format!(
++                "service lifecycle begin system_server={previous_system_server:?}"
++            ));
++            let vector_state = prepare_vector_service_stage()?;
+-        init_event::run_stage("service", false);
+-        thread::sleep(Duration::from_millis(1000));
++            let verify_vector = match vector_state {
++                VectorServiceState::Disabled => {
++                    init_event::run_stage("service", false);
++                    false
++                }
++                VectorServiceState::Running => {
++                    init_event::run_stage_excluding_module("service", false, "zygisk_vector");
++                    true
++                }
++                VectorServiceState::NeedsLaunch => {
++                    // Generic service dispatch only proves spawn(). Vector uses
++                    // the monitored system-sh path that is known-good on A059.
++                    init_event::run_stage_excluding_module("service", false, "zygisk_vector");
++                    launch_vector_service_directly()?;
++                    anyhow::ensure!(
++                        wait_vector_root_daemon(1),
++                        "Vector socket disappeared after launch"
++                    );
++                    true
++                }
++            };
++            ensure_zygote_boundary_after_services(previous_system_server.as_ref())?;
++            if verify_vector {
++                verify_vector_framework_cli()?;
++            }
++            Ok(())
++        })();
+-        restart_zygote_for_late_modules()?;
++        if let Err(error) = service_result {
++            append_module_lifecycle_log(&format!("FAILED: {error:#}"));
++            return Err(error);
++        }
++        append_module_lifecycle_log("service lifecycle verified");
+     }
+
+diff --git a/userspace/ksud/src/init_event.rs b/userspace/ksud/src/init_event.rs
+--- a/userspace/ksud/src/init_event.rs
++++ b/userspace/ksud/src/init_event.rs
+@@ -153,7 +153,35 @@
+     if let Err(e) = crate::module::exec_stage_script(stage, block) {
+         warn!("Failed to exec {stage} scripts: {e}");
+     }
+ }
+
++/// Run a normal lifecycle stage while reserving one module for a monitored
++/// device-specific launcher. Common scripts and the metamodule still run.
++pub fn run_stage_excluding_module(stage: &str, block: bool, excluded_module_id: &str) {
++    utils::umask(0);
++
++    if utils::has_magisk() {
++        warn!("Magisk detected, skip {stage}");
++        return;
++    }
++
++    if crate::utils::is_safe_mode() {
++        warn!("safe mode, skip {stage} scripts");
++        return;
++    }
++
++    if let Err(e) = crate::module::exec_common_scripts(&format!("{stage}.d"), block) {
++        warn!("Failed to exec common {stage} scripts: {e}");
++    }
++
++    if let Err(e) = metamodule::exec_stage_script(stage, block) {
++        warn!("Failed to exec metamodule {stage} script: {e}");
++    }
++
++    if let Err(e) = crate::module::exec_stage_script_excluding(stage, block, excluded_module_id) {
++        warn!("Failed to exec {stage} scripts excluding module {excluded_module_id}: {e}");
++    }
++}
++
+ /// Run the module stage used by the explicit late-load compatibility mode.
+ ///
+diff --git a/userspace/ksud/src/module.rs b/userspace/ksud/src/module.rs
+--- a/userspace/ksud/src/module.rs
++++ b/userspace/ksud/src/module.rs
+@@ -263,8 +263,40 @@
+         exec_script(&script_path, block)
+     })?;
+
+     Ok(())
+ }
+
++/// Execute a lifecycle stage for every active regular module except one that
++/// the caller will launch and monitor itself.
++pub fn exec_stage_script_excluding(
++    stage: &str,
++    block: bool,
++    excluded_module_id: &str,
++) -> Result<()> {
++    let metamodule_dir = metamodule::get_metamodule_path().and_then(|path| canonicalize(path).ok());
++
++    foreach_active_module(|module| {
++        if metamodule_dir.as_ref().is_some_and(|meta_dir| {
++            canonicalize(module).is_ok_and(|resolved| resolved == *meta_dir)
++        }) {
++            return Ok(());
++        }
++
++        if module.file_name().and_then(|name| name.to_str()) == Some(excluded_module_id) {
++            info!("Skipping {stage}.sh for monitored module {excluded_module_id}");
++            return Ok(());
++        }
++
++        let script_path = module.join(format!("{stage}.sh"));
++        if !script_path.exists() {
++            return Ok(());
++        }
++
++        exec_script(&script_path, block)
++    })?;
++
++    Ok(())
++}
++
+ /// Execute a late-load stage without running the same module twice.
+ ///

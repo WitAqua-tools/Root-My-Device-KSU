@@ -1,0 +1,130 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index d14d9dc4..9c2efd78 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -1,10 +1,92 @@
+ use anyhow::{Context, Result};
+ use log::{info, warn};
+ use rustix::cstr;
++use std::fs;
++use std::os::unix::fs::PermissionsExt;
++use std::process::Command;
++use std::thread;
++use std::time::{Duration, Instant};
+ 
+ use crate::module::{handle_updated_modules, prune_modules};
+ use crate::{assets, defs, init_event, metamodule, restorecon, utils};
+ 
++fn process_ids(name: &str) -> Vec<u32> {
++    let Ok(output) = Command::new("/system/bin/pidof").arg(name).output() else {
++        return Vec::new();
++    };
++    if !output.status.success() {
++        return Vec::new();
++    }
++
++    String::from_utf8_lossy(&output.stdout)
++        .split_whitespace()
++        .filter_map(|value| value.parse().ok())
++        .collect()
++}
++
++fn restart_zygote_for_late_modules() -> Result<()> {
++    let old_system_servers = process_ids("system_server");
++    anyhow::ensure!(
++        !old_system_servers.is_empty(),
++        "system_server was not running before the zygote restart"
++    );
++    info!("OnePlus Pad 3 late-load: restarting zygote (old system_server={old_system_servers:?})");
++
++    let status = Command::new("/system/bin/setprop")
++        .args(["ctl.restart", "zygote"])
++        .status()
++        .context("failed to request zygote restart")?;
++    anyhow::ensure!(status.success(), "zygote restart request exited {status}");
++
++    let timeout = Duration::from_secs(25);
++    let started = Instant::now();
++    while started.elapsed() < timeout {
++        let zygote_running = utils::getprop("init.svc.zygote").as_deref() == Some("running");
++        let new_system_servers = process_ids("system_server");
++        let old_gone = old_system_servers
++            .iter()
++            .all(|old_pid| !new_system_servers.contains(old_pid));
++        let replacement_present = new_system_servers
++            .iter()
++            .any(|new_pid| !old_system_servers.contains(new_pid));
++
++        if zygote_running && old_gone && replacement_present {
++            info!(
++                "OnePlus Pad 3 late-load: replacement system_server verified (new={new_system_servers:?})"
++            );
++            thread::sleep(Duration::from_millis(500));
++            return Ok(());
++        }
++        thread::sleep(Duration::from_millis(250));
++    }
++
++    anyhow::bail!(
++        "zygote restart did not replace system_server within {} seconds (old={old_system_servers:?}, current={:?})",
++        timeout.as_secs(),
++        process_ids("system_server")
++    )
++}
++
++fn write_module_completion_marker() -> Result<()> {
++    const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
++    const MARKER_PATH: &str = "/data/local/tmp/.ksu-late-load-modules-ok";
++
++    let boot_id = fs::read_to_string(BOOT_ID_PATH)
++        .context("failed to read boot_id for the late-load completion marker")?;
++    let boot_id = boot_id.trim();
++    anyhow::ensure!(!boot_id.is_empty(), "boot_id is empty");
++
++    let temporary_path = format!("{MARKER_PATH}.tmp.{}", std::process::id());
++    fs::write(&temporary_path, format!("{boot_id}\n"))
++        .context("failed to write the temporary late-load completion marker")?;
++    fs::set_permissions(&temporary_path, fs::Permissions::from_mode(0o644))
++        .context("failed to chmod the late-load completion marker")?;
++    fs::rename(&temporary_path, MARKER_PATH)
++        .context("failed to publish the late-load completion marker")?;
++    info!("OnePlus Pad 3 late-load: current-boot completion marker published");
++    Ok(())
++}
++
+ fn dump_process_info(label: &str) {
+     use rustix::process::{getgid, getgroups, getpid, getuid};
+ 
+@@ -48,6 +130,17 @@ pub fn run(
+             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+             .unwrap_or(false);
+ 
++    if run_module_scripts {
++        anyhow::ensure!(
++            !utils::has_magisk(),
++            "module late-load was requested while Magisk is active"
++        );
++        anyhow::ensure!(
++            !utils::is_safe_mode(),
++            "module late-load was requested while KernelSU safe mode is active"
++        );
++    }
++
+     // Copy the daemon before loading the module changes this process's
+     // security context. The remaining install steps require KernelSU policy.
+     utils::stage_daemon_from("/data/local/tmp/.ksud-stage").context("Failed to stage ksud")?;
+@@ -192,11 +285,14 @@ pub fn run(
+     // 12. Execute service stage scripts (non-blocking)
+     if run_module_scripts {
+         init_event::run_stage("service", false);
++        thread::sleep(Duration::from_millis(1000));
++        restart_zygote_for_late_modules()?;
+     }
+ 
+     // 13. Execute boot-completed stage scripts (non-blocking)
+     if run_module_scripts {
+         init_event::run_stage("boot-completed", false);
++        write_module_completion_marker()?;
+     }
+ 
+     Ok(())

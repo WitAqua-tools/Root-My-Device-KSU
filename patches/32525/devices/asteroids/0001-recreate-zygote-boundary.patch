@@ -1,0 +1,101 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -1,10 +1,72 @@
+ use anyhow::{Context, Result};
+ use log::{info, warn};
+ use rustix::cstr;
++use std::fs;
++use std::os::unix::fs::PermissionsExt;
++use std::process::Command;
++use std::thread;
++use std::time::Duration;
+ 
+ use crate::module::{handle_updated_modules, prune_modules};
+ use crate::{assets, defs, init_event, metamodule, restorecon, utils};
+ 
++fn process_id(name: &str) -> Option<String> {
++    let output = Command::new("/system/bin/pidof").arg(name).output().ok()?;
++    if !output.status.success() {
++        return None;
++    }
++    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
++    (!value.is_empty()).then_some(value)
++}
++
++fn restart_zygote_for_late_modules() -> Result<()> {
++    let old_system_server = process_id("system_server");
++    info!(
++        "Asteroids late-load: recreating zygote-start boundary (old system_server={old_system_server:?})"
++    );
++
++    let status = Command::new("/system/bin/setprop")
++        .args(["ctl.restart", "zygote"])
++        .status()
++        .context("failed to request zygote restart")?;
++    anyhow::ensure!(status.success(), "zygote restart request exited {status}");
++
++    // A successful ctl.restart request only means init accepted it. Wait until
++    // the replacement zygote has produced a replacement system_server so the
++    // service stage cannot race the soft framework restart.
++    for _ in 0..80 {
++        let zygote_running = utils::getprop("init.svc.zygote").as_deref() == Some("running");
++        let new_system_server = process_id("system_server");
++        let system_server_replaced = new_system_server.is_some()
++            && (old_system_server.is_none() || new_system_server != old_system_server);
++        if zygote_running && system_server_replaced {
++            info!(
++                "Asteroids late-load: zygote/system_server restarted (system_server={new_system_server:?})"
++            );
++            thread::sleep(Duration::from_millis(500));
++            return Ok(());
++        }
++        thread::sleep(Duration::from_millis(250));
++    }
++
++    anyhow::bail!("zygote restart did not produce a replacement system_server within 20 seconds")
++}
++
++fn write_module_completion_marker() -> Result<()> {
++    const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
++    const MARKER: &str = "/data/local/tmp/.ksu-late-load-modules-ok";
++    const TEMP: &str = "/data/local/tmp/.ksu-late-load-modules-ok.tmp";
++
++    let boot_id =
++        fs::read_to_string(BOOT_ID).context("failed to read boot_id for module marker")?;
++    fs::write(TEMP, boot_id.as_bytes()).context("failed to write temporary module marker")?;
++    fs::set_permissions(TEMP, fs::Permissions::from_mode(0o644))
++        .context("failed to chmod module marker")?;
++    fs::rename(TEMP, MARKER).context("failed to publish module marker")?;
++    info!("Asteroids late-load: module completion marker published");
++    Ok(())
++}
++
+ fn dump_process_info(label: &str) {
+     use rustix::process::{getgid, getgroups, getpid, getuid};
+ 
+@@ -189,14 +251,23 @@
+         init_event::run_stage("post-mount", true);
+     }
+ 
+-    // 12. Execute service stage scripts (non-blocking)
++    // Asteroids reaches this path after Android is already booted. Start the
++    // service stage while the current framework is still alive. Some Zygisk
++    // clients (notably Vector) create their root-side rendezvous daemon only
++    // from service.sh; restarting zygote before that daemon exists leaves the
++    // replacement system_server uninjected even though the Zygisk provider is
++    // already running. Give non-blocking service scripts a short head start,
++    // then recreate the zygote-start boundary.
+     if run_module_scripts {
+         init_event::run_stage("service", false);
++        thread::sleep(Duration::from_millis(1000));
++        restart_zygote_for_late_modules()?;
+     }
+ 
+     // 13. Execute boot-completed stage scripts (non-blocking)
+     if run_module_scripts {
+         init_event::run_stage("boot-completed", false);
++        write_module_completion_marker()?;
+     }
+ 
+     Ok(())

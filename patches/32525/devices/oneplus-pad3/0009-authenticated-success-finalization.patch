@@ -1,0 +1,1127 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index 1a99ef7d..f7fd3691 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -4,7 +4,7 @@ use rustix::cstr;
+ use std::ffi::CString;
+ use std::fs::{self, File, OpenOptions};
+ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+-use std::os::fd::AsRawFd;
++use std::os::fd::{AsRawFd, FromRawFd};
+ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+ use std::os::unix::process::CommandExt;
+ use std::path::{Path, PathBuf};
+@@ -225,6 +225,7 @@ const COMPLETION_RUN_ID_ENV: &str = "KSU_LATE_LOAD_RUN_ID";
+ const CLEANUP_ORIGINAL_KPTR_ENV: &str = "KSU_LATE_LOAD_CLEANUP_KPTR";
+ const CLEANUP_MODULES_ENV: &str = "KSU_LATE_LOAD_CLEANUP_MODULES";
+ const CLEAN_ABORT_EXIT_STATUS: i32 = 200;
++const CLEAN_SUCCESS_EXIT_STATUS: i32 = 201;
+ const PROC_SUPER_MAGIC: libc::c_long = 0x9fa0;
+ const SELINUX_MAGIC: libc::c_long = 0xf97c_ff8c;
+ const VECTOR_ADAPTER_SCRIPT: &str =
+@@ -357,6 +358,137 @@ fn open_cleanup_directory(path: &str, private_root: bool) -> Result<File> {
+     Ok(directory)
+ }
+ 
++fn validate_root_data_directory(directory: &File, label: &str) -> Result<()> {
++    let metadata = directory
++        .metadata()
++        .with_context(|| format!("failed to fstat retained {label}"))?;
++    anyhow::ensure!(
++        metadata.file_type().is_dir()
++            && metadata.uid() == 0
++            && metadata.gid() == 0
++            && metadata.mode() & 0o022 == 0,
++        "retained {label} is not a protected root:root directory"
++    );
++    Ok(())
++}
++
++fn open_root_data_directory(path: &str, label: &str) -> Result<File> {
++    let directory = OpenOptions::new()
++        .read(true)
++        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++        .open(path)
++        .with_context(|| format!("failed to pin {label} {path}"))?;
++    validate_root_data_directory(&directory, label)?;
++    Ok(directory)
++}
++
++fn openat_readonly(directory: &File, name: &str, label: &str) -> Result<File> {
++    let name = CString::new(name).with_context(|| format!("{label} name contains NUL"))?;
++    let fd = unsafe {
++        libc::openat(
++            directory.as_raw_fd(),
++            name.as_ptr(),
++            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
++        )
++    };
++    if fd < 0 {
++        return Err(std::io::Error::last_os_error())
++            .with_context(|| format!("failed to open retained {label}"));
++    }
++    Ok(unsafe { File::from_raw_fd(fd) })
++}
++
++fn fstatat_raw(directory: &File, name: &str, label: &str) -> Result<libc::stat> {
++    fstatat_optional(directory, name, label)?.with_context(|| format!("retained {label} is absent"))
++}
++
++fn fstatat_optional(directory: &File, name: &str, label: &str) -> Result<Option<libc::stat>> {
++    let name = CString::new(name).with_context(|| format!("{label} name contains NUL"))?;
++    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
++    let result = unsafe {
++        libc::fstatat(
++            directory.as_raw_fd(),
++            name.as_ptr(),
++            metadata.as_mut_ptr(),
++            libc::AT_SYMLINK_NOFOLLOW,
++        )
++    };
++    if result != 0 {
++        let error = std::io::Error::last_os_error();
++        if error.kind() == ErrorKind::NotFound {
++            return Ok(None);
++        }
++        return Err(error).with_context(|| format!("failed to stat retained {label}"));
++    }
++    Ok(Some(unsafe { metadata.assume_init() }))
++}
++
++fn prove_name_absent(directory: &File, name: &str, label: &str) -> Result<()> {
++    let name = CString::new(name).with_context(|| format!("{label} name contains NUL"))?;
++    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
++    let result = unsafe {
++        libc::fstatat(
++            directory.as_raw_fd(),
++            name.as_ptr(),
++            metadata.as_mut_ptr(),
++            libc::AT_SYMLINK_NOFOLLOW,
++        )
++    };
++    if result == 0 {
++        anyhow::bail!("retained {label} name is still present");
++    }
++    let error = std::io::Error::last_os_error();
++    anyhow::ensure!(
++        error.kind() == ErrorKind::NotFound,
++        "retained {label} absence could not be proved: {error}"
++    );
++    Ok(())
++}
++
++fn read_exact_file(file: &mut File, maximum: usize, label: &str) -> Result<Vec<u8>> {
++    file.seek(SeekFrom::Start(0))
++        .with_context(|| format!("failed to seek retained {label}"))?;
++    let mut value = Vec::new();
++    file.take((maximum + 1) as u64)
++        .read_to_end(&mut value)
++        .with_context(|| format!("failed to read retained {label}"))?;
++    anyhow::ensure!(value.len() <= maximum, "retained {label} is too large");
++    Ok(value)
++}
++
++fn digest_exact_file(file: &mut File, expected_size: u64, label: &str) -> Result<String> {
++    let before = file
++        .metadata()
++        .with_context(|| format!("failed to fstat retained {label}"))?;
++    anyhow::ensure!(
++        before.file_type().is_file() && before.len() == expected_size,
++        "retained {label} has the wrong type or size"
++    );
++    let bytes = read_exact_file(
++        file,
++        usize::try_from(expected_size).context("retained daemon size overflow")?,
++        label,
++    )?;
++    anyhow::ensure!(
++        bytes.len() as u64 == expected_size,
++        "retained {label} changed size while hashing"
++    );
++    let after = file
++        .metadata()
++        .with_context(|| format!("failed to refstat retained {label}"))?;
++    anyhow::ensure!(
++        before.dev() == after.dev()
++            && before.ino() == after.ino()
++            && before.len() == after.len()
++            && before.uid() == after.uid()
++            && before.gid() == after.gid()
++            && before.mode() == after.mode()
++            && before.nlink() == after.nlink(),
++        "retained {label} metadata changed while hashing"
++    );
++    Ok(sha256::digest(bytes.as_slice()))
++}
++
+ fn validate_regular_authority(
+     file: &File,
+     expected_fs_magic: libc::c_long,
+@@ -503,12 +635,20 @@ fn ensure_enforcing_exact(file: &mut File) -> Result<()> {
+ struct CleanupAuthorities {
+     kptr_restrict: File,
+     selinux_enforce: File,
++    installed_parent: File,
++    installed_daemon: File,
+     private_receipts: File,
+     public_receipts: File,
++    run_directory: File,
++    private_exec: File,
++    run_name: String,
++    installed_device: u64,
++    installed_inode: u64,
++    installed_size: u64,
+ }
+ 
+ impl CleanupAuthorities {
+-    fn pin_after_load() -> Result<Self> {
++    fn pin_before_load(staged_daemon: &Path, expected_daemon_sha256: &str) -> Result<Self> {
+         let mut kptr_restrict = open_regular_authority(
+             "/proc/sys/kernel/kptr_restrict",
+             PROC_SUPER_MAGIC,
+@@ -524,25 +664,151 @@ impl CleanupAuthorities {
+             "SELinux enforcing state",
+         )?;
+         anyhow::ensure!(
+-            read_exact_digit(&mut selinux_enforce, "SELinux enforcing state")? == b'1',
+-            "SELinux was not exactly enforcing when its cleanup fd was pinned"
++            read_exact_digit(&mut selinux_enforce, "SELinux enforcing state")? == b'0',
++            "SELinux was not exactly permissive when its cleanup fd was pinned"
++        );
++
++        let run_path = staged_daemon
++            .parent()
++            .context("trusted staged daemon has no retained run directory")?;
++        anyhow::ensure!(
++            run_path.parent() == Some(Path::new(PRIVATE_LATE_LOAD_ROOT)),
++            "trusted staged daemon run directory escaped the private root"
++        );
++        let run_name = run_path
++            .file_name()
++            .and_then(|name| name.to_str())
++            .context("trusted staged daemon run directory is not UTF-8")?;
++        anyhow::ensure!(
++            !run_name.is_empty() && run_name.bytes().all(|byte| byte.is_ascii_digit()),
++            "trusted staged daemon run directory is not decimal"
++        );
++
++        let installed_parent = open_root_data_directory("/data/adb", "installed daemon parent")?;
++        let mut installed_daemon = openat_readonly(&installed_parent, "ksud", "installed daemon")?;
++        let private_receipts = open_cleanup_directory(PRIVATE_LATE_LOAD_ROOT, true)?;
++        let run_directory = open_root_data_directory(
++            run_path
++                .to_str()
++                .context("trusted staged daemon run path is not UTF-8")?,
++            "private run directory",
++        )?;
++        let mut private_exec =
++            openat_readonly(&run_directory, "ksud-exec", "private executable link")?;
++
++        let installed = installed_daemon
++            .metadata()
++            .context("failed to fstat retained installed daemon")?;
++        let private = private_exec
++            .metadata()
++            .context("failed to fstat retained private executable link")?;
++        for (metadata, label) in [
++            (&installed, "installed daemon"),
++            (&private, "private executable link"),
++        ] {
++            anyhow::ensure!(
++                metadata.file_type().is_file()
++                    && metadata.uid() == 0
++                    && metadata.gid() == 0
++                    && metadata.mode() & 0o777 == 0o755
++                    && metadata.nlink() == 2
++                    && metadata.len() > 0
++                    && metadata.len() <= 64 * 1024 * 1024,
++                "retained {label} metadata is not root:root 0755 nlink=2"
++            );
++        }
++        anyhow::ensure!(
++            installed.dev() == private.dev()
++                && installed.ino() == private.ino()
++                && installed.len() == private.len(),
++            "installed daemon is not the retained private executable inode"
+         );
++        let installed_digest =
++            digest_exact_file(&mut installed_daemon, installed.len(), "installed daemon")?;
++        let private_digest =
++            digest_exact_file(&mut private_exec, private.len(), "private executable link")?;
++        anyhow::ensure!(
++            installed_digest == expected_daemon_sha256 && private_digest == expected_daemon_sha256,
++            "retained installed/private daemon SHA-256 does not match the staged build pin"
++        );
++        prove_name_absent(&run_directory, "ksud-stage", "consumed staged daemon")?;
++
+         Ok(Self {
+             kptr_restrict,
+             selinux_enforce,
+-            private_receipts: open_cleanup_directory(PRIVATE_LATE_LOAD_ROOT, true)?,
++            installed_parent,
++            installed_daemon,
++            private_receipts,
+             public_receipts: open_cleanup_directory("/data/local/tmp", false)?,
++            run_directory,
++            private_exec,
++            run_name: run_name.to_owned(),
++            installed_device: installed.dev(),
++            installed_inode: installed.ino(),
++            installed_size: installed.len(),
+         })
+     }
++
++    fn validate_after_load(&mut self) -> Result<()> {
++        anyhow::ensure!(
++            read_exact_digit(&mut self.kptr_restrict, "kptr_restrict")? == b'0',
++            "kptr_restrict changed before post-load authority validation"
++        );
++        require_enforcing_exact(&mut self.selinux_enforce)?;
++        validate_root_data_directory(&self.installed_parent, "installed daemon parent")?;
++        validate_cleanup_directory(&self.private_receipts, true)?;
++        validate_cleanup_directory(&self.public_receipts, false)?;
++        validate_root_data_directory(&self.run_directory, "private run directory")?;
++        Ok(())
++    }
+ }
+ 
+ struct PostLoadCleanupExpectation {
+     expected_daemon_sha256: String,
+     cleanup_modules: bool,
++    expected_run_id: Option<String>,
++    original_kptr: u8,
++    module_loaded: bool,
+     authorities: Option<CleanupAuthorities>,
+ }
+ 
+-fn cleanup_post_load_failure(expectation: &mut PostLoadCleanupExpectation) -> Result<()> {
++fn cleanup_original_kptr_from_env() -> Result<u8> {
++    let original = std::env::var(CLEANUP_ORIGINAL_KPTR_ENV)
++        .context("post-load cleanup original kptr value is missing")?;
++    match original.as_bytes() {
++        b"0" => Ok(b'0'),
++        b"1" => Ok(b'1'),
++        b"2" => Ok(b'2'),
++        _ => anyhow::bail!("post-load cleanup original kptr value is invalid"),
++    }
++}
++
++fn capture_post_load_binding(
++    expected_daemon_sha256: &str,
++    cleanup_modules: bool,
++) -> Result<(u8, Option<String>)> {
++    anyhow::ensure!(
++        std::env::var(STAGED_DAEMON_SHA256_ENV).as_deref() == Ok(expected_daemon_sha256),
++        "post-load cleanup daemon digest is not the staged build pin"
++    );
++    let modules_env =
++        std::env::var(CLEANUP_MODULES_ENV).context("post-load cleanup module flag is missing")?;
++    anyhow::ensure!(
++        modules_env == if cleanup_modules { "1" } else { "0" },
++        "post-load cleanup module flag does not match the invocation"
++    );
++    let run_id = cleanup_modules
++        .then(completion_run_id)
++        .transpose()
++        .context("post-load cleanup run binding is invalid")?;
++    Ok((cleanup_original_kptr_from_env()?, run_id))
++}
++
++fn validate_post_load_executor(expectation: &PostLoadCleanupExpectation) -> Result<()> {
++    anyhow::ensure!(
++        expectation.module_loaded,
++        "post-load executor validation ran before module load completed"
++    );
+     let domain = fs::read_to_string("/proc/self/attr/current")
+         .context("failed to read cleanup executor SELinux domain")?;
+     anyhow::ensure!(
+@@ -553,72 +819,562 @@ fn cleanup_post_load_failure(expectation: &mut PostLoadCleanupExpectation) -> Re
+         unsafe { libc::geteuid() } == 0 && unsafe { libc::getegid() } == 0,
+         "post-load cleanup executor is not root:root"
+     );
++    let (original_kptr, run_id) = capture_post_load_binding(
++        &expectation.expected_daemon_sha256,
++        expectation.cleanup_modules,
++    )?;
+     anyhow::ensure!(
+-        std::env::var(STAGED_DAEMON_SHA256_ENV).as_deref()
+-            == Ok(expectation.expected_daemon_sha256.as_str()),
+-        "post-load cleanup daemon digest is not the staged build pin"
++        original_kptr == expectation.original_kptr && run_id == expectation.expected_run_id,
++        "post-load cleanup binding changed after module load"
+     );
+-    let modules_env =
+-        std::env::var(CLEANUP_MODULES_ENV).context("post-load cleanup module flag is missing")?;
++    Ok(())
++}
++
++fn unlink_same_inode_or_absent(
++    directory: &File,
++    name: &str,
++    device: u64,
++    inode: u64,
++    label: &str,
++) -> Result<()> {
++    match fstatat_optional(directory, name, label)? {
++        Some(metadata) => {
++            anyhow::ensure!(
++                metadata.st_dev == device && metadata.st_ino == inode,
++                "refused to unlink replacement {label}"
++            );
++            let name = CString::new(name).with_context(|| format!("{label} name contains NUL"))?;
++            let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
++            if result != 0 {
++                return Err(std::io::Error::last_os_error())
++                    .with_context(|| format!("failed to unlink retained {label}"));
++            }
++            directory
++                .sync_all()
++                .with_context(|| format!("failed to sync retained {label} directory"))?;
++            prove_name_absent(directory, name.to_str()?, label)
++        }
++        None => Ok(()),
++    }
++}
++
++fn remove_private_run_exact(authorities: &mut CleanupAuthorities) -> Result<()> {
++    validate_cleanup_directory(&authorities.private_receipts, true)?;
++    validate_root_data_directory(&authorities.run_directory, "private run directory")?;
++    let installed = authorities
++        .installed_daemon
++        .metadata()
++        .context("failed to fstat installed daemon before private-run cleanup")?;
++    let private = authorities
++        .private_exec
++        .metadata()
++        .context("failed to fstat private executable before cleanup")?;
+     anyhow::ensure!(
+-        modules_env
+-            == if expectation.cleanup_modules {
+-                "1"
+-            } else {
+-                "0"
+-            },
+-        "post-load cleanup module flag does not match the invocation"
++        installed.dev() == authorities.installed_device
++            && installed.ino() == authorities.installed_inode
++            && private.dev() == authorities.installed_device
++            && private.ino() == authorities.installed_inode,
++        "installed/private daemon identity changed before link cleanup"
+     );
+-    if expectation.cleanup_modules {
+-        completion_run_id().context("post-load cleanup run binding is invalid")?;
++    prove_name_absent(
++        &authorities.run_directory,
++        "ksud-stage",
++        "consumed staged daemon",
++    )?;
++    let exec_name = fstatat_optional(
++        &authorities.run_directory,
++        "ksud-exec",
++        "private executable link",
++    )?;
++    match (installed.nlink(), private.nlink(), exec_name) {
++        (2, 2, Some(path)) => {
++            anyhow::ensure!(
++                path.st_dev == authorities.installed_device
++                    && path.st_ino == authorities.installed_inode,
++                "private executable pathname was replaced before unlink"
++            );
++            unlink_same_inode_or_absent(
++                &authorities.run_directory,
++                "ksud-exec",
++                authorities.installed_device,
++                authorities.installed_inode,
++                "private executable link",
++            )?;
++        }
++        (1, 1, None) => {}
++        _ => anyhow::bail!("private executable cleanup state is not exact or idempotent"),
+     }
+-    let original = std::env::var(CLEANUP_ORIGINAL_KPTR_ENV)
+-        .context("post-load cleanup original kptr value is missing")?;
+-    let original = match original.as_bytes() {
+-        b"0" => b'0',
+-        b"1" => b'1',
+-        b"2" => b'2',
+-        _ => anyhow::bail!("post-load cleanup original kptr value is invalid"),
++    let installed_after = authorities
++        .installed_daemon
++        .metadata()
++        .context("failed to fstat installed daemon after private link cleanup")?;
++    anyhow::ensure!(
++        installed_after.dev() == authorities.installed_device
++            && installed_after.ino() == authorities.installed_inode
++            && installed_after.nlink() == 1,
++        "installed daemon did not become nlink=1 after private link cleanup"
++    );
++    authorities
++        .installed_parent
++        .sync_all()
++        .context("failed to sync installed daemon parent after trusted rename")?;
++
++    let run_name = CString::new(authorities.run_name.as_str())
++        .context("private run directory name contains NUL")?;
++    let run_path = fstatat_optional(
++        &authorities.private_receipts,
++        &authorities.run_name,
++        "private run directory pathname",
++    )?;
++    let run_fd = authorities
++        .run_directory
++        .metadata()
++        .context("failed to fstat private run directory")?;
++    if let Some(run_path) = run_path {
++        anyhow::ensure!(
++            run_path.st_dev == run_fd.dev() && run_path.st_ino == run_fd.ino(),
++            "private run directory pathname changed after pin"
++        );
++        let removed = unsafe {
++            libc::unlinkat(
++                authorities.private_receipts.as_raw_fd(),
++                run_name.as_ptr(),
++                libc::AT_REMOVEDIR,
++            )
++        };
++        if removed != 0 {
++            return Err(std::io::Error::last_os_error())
++                .context("failed to remove retained private run directory");
++        }
++    }
++    authorities
++        .private_receipts
++        .sync_all()
++        .context("failed to sync private late-load root after run cleanup")?;
++    prove_name_absent(
++        &authorities.private_receipts,
++        &authorities.run_name,
++        "private run directory",
++    )
++}
++
++fn verify_installed_daemon_exact(
++    authorities: &mut CleanupAuthorities,
++    expected_daemon_sha256: &str,
++) -> Result<()> {
++    validate_root_data_directory(&authorities.installed_parent, "installed daemon parent")?;
++    let metadata = authorities
++        .installed_daemon
++        .metadata()
++        .context("failed to fstat retained installed daemon")?;
++    anyhow::ensure!(
++        metadata.file_type().is_file()
++            && metadata.uid() == 0
++            && metadata.gid() == 0
++            && metadata.mode() & 0o777 == 0o755
++            && metadata.nlink() == 1
++            && metadata.dev() == authorities.installed_device
++            && metadata.ino() == authorities.installed_inode
++            && metadata.len() == authorities.installed_size,
++        "installed /data/adb/ksud metadata/inode is not exact root:root 0755 nlink=1"
++    );
++    let path = fstatat_raw(
++        &authorities.installed_parent,
++        "ksud",
++        "installed daemon pathname",
++    )?;
++    anyhow::ensure!(
++        path.st_dev as u64 == authorities.installed_device
++            && path.st_ino as u64 == authorities.installed_inode
++            && u64::from(path.st_nlink) == 1
++            && path.st_uid == 0
++            && path.st_gid == 0
++            && (path.st_mode as u32 & 0o777) == 0o755
++            && path.st_size as u64 == authorities.installed_size,
++        "installed daemon pathname no longer names the retained inode"
++    );
++    let first = digest_exact_file(
++        &mut authorities.installed_daemon,
++        authorities.installed_size,
++        "installed daemon",
++    )?;
++    let second = digest_exact_file(
++        &mut authorities.private_exec,
++        authorities.installed_size,
++        "unlinked private executable inode",
++    )?;
++    anyhow::ensure!(
++        first == expected_daemon_sha256 && second == expected_daemon_sha256,
++        "installed daemon SHA-256 failed exact post-cleanup verification"
++    );
++    Ok(())
++}
++
++fn verify_current_path_identities(authorities: &CleanupAuthorities) -> Result<()> {
++    let current_adb = open_root_data_directory("/data/adb", "current installed daemon parent")?;
++    let retained_adb = authorities
++        .installed_parent
++        .metadata()
++        .context("failed to fstat retained installed daemon parent")?;
++    let current_adb_metadata = current_adb
++        .metadata()
++        .context("failed to fstat current installed daemon parent")?;
++    anyhow::ensure!(
++        current_adb_metadata.dev() == retained_adb.dev()
++            && current_adb_metadata.ino() == retained_adb.ino(),
++        "current /data/adb mount does not match the retained finalization authority"
++    );
++
++    let current_private = open_cleanup_directory(PRIVATE_LATE_LOAD_ROOT, true)?;
++    let retained_private = authorities
++        .private_receipts
++        .metadata()
++        .context("failed to fstat retained private late-load root")?;
++    let current_private_metadata = current_private
++        .metadata()
++        .context("failed to fstat current private late-load root")?;
++    anyhow::ensure!(
++        current_private_metadata.dev() == retained_private.dev()
++            && current_private_metadata.ino() == retained_private.ino(),
++        "current private late-load root does not match the retained authority"
++    );
++
++    let current_installed = openat_readonly(&current_adb, "ksud", "current installed daemon")?;
++    let current_installed_metadata = current_installed
++        .metadata()
++        .context("failed to fstat current installed daemon")?;
++    anyhow::ensure!(
++        current_installed_metadata.dev() == authorities.installed_device
++            && current_installed_metadata.ino() == authorities.installed_inode
++            && current_installed_metadata.nlink() == 1,
++        "current /data/adb/ksud does not name the retained installed inode"
++    );
++    Ok(())
++}
++
++fn verify_fresh_ksu_control() -> Result<()> {
++    let info = crate::ksucalls::refresh_info();
++    anyhow::ensure!(info.version != 0, "final KernelSU control version is zero");
++    anyhow::ensure!(
++        info.uapi_version == crate::ksu_uapi::KERNEL_SU_UAPI_VERSION,
++        "final KernelSU UAPI mismatch: kernel={} userspace={}",
++        info.uapi_version,
++        crate::ksu_uapi::KERNEL_SU_UAPI_VERSION
++    );
++    anyhow::ensure!(
++        info.flags & crate::ksu_uapi::KSU_GET_INFO_FLAG_LKM != 0
++            && info.flags & crate::ksu_uapi::KSU_GET_INFO_FLAG_LATE_LOAD != 0,
++        "final KernelSU control flags lack LKM+late-load: 0x{:x}",
++        info.flags
++    );
++    Ok(())
++}
++
++fn expected_completion_receipt(expectation: &PostLoadCleanupExpectation) -> Result<Vec<u8>> {
++    let run_id = expectation
++        .expected_run_id
++        .as_deref()
++        .context("module finalization has no captured run id")?;
++    let boot_id = current_boot_id()?;
++    Ok(format!(
++        "version=1\nboot_id={boot_id}\nrun_id={run_id}\nksud_sha256={}\n",
++        expectation.expected_daemon_sha256
++    )
++    .into_bytes())
++}
++
++fn verify_receipt_exact(
++    directory: &File,
++    name: &str,
++    expected: &[u8],
++    mode: u32,
++    label: &str,
++) -> Result<()> {
++    let mut receipt = openat_readonly(directory, name, label)?;
++    let metadata = receipt
++        .metadata()
++        .with_context(|| format!("failed to fstat retained {label}"))?;
++    anyhow::ensure!(
++        metadata.file_type().is_file()
++            && metadata.uid() == 0
++            && metadata.gid() == 0
++            && metadata.mode() & 0o777 == mode
++            && metadata.nlink() == 1
++            && metadata.len() == expected.len() as u64,
++        "retained {label} metadata is not exact"
++    );
++    let content = read_exact_file(&mut receipt, expected.len(), label)?;
++    anyhow::ensure!(content == expected, "retained {label} content is not exact");
++    let path = fstatat_raw(directory, name, label)?;
++    anyhow::ensure!(
++        path.st_dev as u64 == metadata.dev()
++            && path.st_ino as u64 == metadata.ino()
++            && u64::from(path.st_nlink) == 1
++            && path.st_uid == 0
++            && path.st_gid == 0
++            && (path.st_mode as u32 & 0o777) == mode
++            && path.st_size as u64 == expected.len() as u64,
++        "retained {label} pathname identity changed"
++    );
++    Ok(())
++}
++
++fn publish_public_receipt_exact(
++    authorities: &CleanupAuthorities,
++    run_id: &str,
++    content: &[u8],
++) -> Result<()> {
++    validate_cleanup_directory(&authorities.public_receipts, false)?;
++    let temp_name = format!(
++        ".ksu-late-load-modules-ok.tmp.{}.{}",
++        std::process::id(),
++        run_id
++    );
++    let temp_c =
++        CString::new(temp_name.as_str()).context("public receipt temp name contains NUL")?;
++    let final_c =
++        CString::new(".ksu-late-load-modules-ok").context("public receipt name contains NUL")?;
++    let fd = unsafe {
++        libc::openat(
++            authorities.public_receipts.as_raw_fd(),
++            temp_c.as_ptr(),
++            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
++            0o600,
++        )
+     };
++    if fd < 0 {
++        return Err(std::io::Error::last_os_error())
++            .context("failed to create public receipt temporary file");
++    }
++    let mut temporary = unsafe { File::from_raw_fd(fd) };
++    let result = (|| -> Result<()> {
++        let owned = unsafe { libc::fchown(temporary.as_raw_fd(), 0, 0) };
++        let chmod = unsafe { libc::fchmod(temporary.as_raw_fd(), 0o644) };
++        if owned != 0 || chmod != 0 {
++            return Err(std::io::Error::last_os_error())
++                .context("failed to secure public receipt temporary file");
++        }
++        temporary
++            .write_all(content)
++            .context("failed to write public receipt temporary file")?;
++        temporary
++            .sync_all()
++            .context("failed to sync public receipt temporary file")?;
++        let metadata = temporary
++            .metadata()
++            .context("failed to fstat public receipt temporary file")?;
++        anyhow::ensure!(
++            metadata.file_type().is_file()
++                && metadata.uid() == 0
++                && metadata.gid() == 0
++                && metadata.mode() & 0o777 == 0o644
++                && metadata.nlink() == 1
++                && metadata.len() == content.len() as u64,
++            "public receipt temporary metadata is not exact"
++        );
++        let path = fstatat_raw(
++            &authorities.public_receipts,
++            &temp_name,
++            "public receipt temporary pathname",
++        )?;
++        anyhow::ensure!(
++            path.st_dev as u64 == metadata.dev() && path.st_ino as u64 == metadata.ino(),
++            "public receipt temporary pathname was replaced"
++        );
++        let renamed = unsafe {
++            libc::renameat(
++                authorities.public_receipts.as_raw_fd(),
++                temp_c.as_ptr(),
++                authorities.public_receipts.as_raw_fd(),
++                final_c.as_ptr(),
++            )
++        };
++        if renamed != 0 {
++            return Err(std::io::Error::last_os_error())
++                .context("failed to atomically publish public receipt");
++        }
++        authorities
++            .public_receipts
++            .sync_all()
++            .context("failed to sync public receipt directory")?;
++        verify_receipt_exact(
++            &authorities.public_receipts,
++            ".ksu-late-load-modules-ok",
++            content,
++            0o644,
++            "public completion receipt",
++        )?;
++        let path_identity = open_cleanup_directory("/data/local/tmp", false)?
++            .metadata()
++            .context("failed to recheck public receipt directory identity")?;
++        let retained_identity = authorities
++            .public_receipts
++            .metadata()
++            .context("failed to fstat retained public receipt directory")?;
++        anyhow::ensure!(
++            path_identity.dev() == retained_identity.dev()
++                && path_identity.ino() == retained_identity.ino(),
++            "public receipt directory pathname changed after pin"
++        );
++        Ok(())
++    })();
++    if result.is_err()
++        && let Ok(path) = fstatat_raw(
++            &authorities.public_receipts,
++            &temp_name,
++            "failed public receipt temporary pathname",
++        )
++        && let Ok(metadata) = temporary.metadata()
++        && path.st_dev == metadata.dev()
++        && path.st_ino == metadata.ino()
++    {
++        let _ =
++            unsafe { libc::unlinkat(authorities.public_receipts.as_raw_fd(), temp_c.as_ptr(), 0) };
++        let _ = authorities.public_receipts.sync_all();
++    }
++    result
++}
+ 
+-    // Attempt every independent rollback before deciding whether the reserved
+-    // authenticated exit may be used. A single failed proof leaves ksud on its
+-    // ordinary error path and the C watcher retains its fail-stop lock.
++fn require_enforcing_exact(file: &mut File) -> Result<()> {
++    anyhow::ensure!(
++        read_exact_digit(file, "SELinux enforcing state")? == b'1',
++        "SELinux was not exact enforcing=1 during success finalization"
++    );
++    Ok(())
++}
++
++fn require_original_kptr_exact(file: &mut File, original: u8) -> Result<()> {
++    anyhow::ensure!(
++        read_exact_digit(file, "kptr_restrict")? == original,
++        "kptr_restrict did not retain the captured original value"
++    );
++    Ok(())
++}
++
++fn exit_clean_abort() -> ! {
++    std::process::exit(CLEAN_ABORT_EXIT_STATUS);
++}
++
++fn finalize_post_load_success(expectation: &mut PostLoadCleanupExpectation) -> Result<()> {
++    validate_post_load_executor(expectation)?;
++    let receipt = expectation
++        .cleanup_modules
++        .then(|| expected_completion_receipt(expectation))
++        .transpose()?;
+     let authorities = expectation
+         .authorities
+         .as_mut()
+-        .context("post-load cleanup authority fds were not pinned after module load")?;
+-    let kptr = restore_kptr_restrict_exact(&mut authorities.kptr_restrict, original);
+-    let trusted = expectation.cleanup_modules.then(|| {
+-        unlink_sync_prove_absent(
++        .context("success finalizer has no retained cleanup authorities")?;
++
++    verify_fresh_ksu_control()?;
++    if let Some(content) = receipt.as_deref() {
++        verify_receipt_exact(
+             &authorities.private_receipts,
+-            PRIVATE_LATE_LOAD_ROOT,
+             "modules-loaded",
+-            true,
+-        )
+-    });
+-    let public = expectation.cleanup_modules.then(|| {
+-        unlink_sync_prove_absent(
++            content,
++            0o600,
++            "trusted completion receipt",
++        )?;
++    }
++    remove_private_run_exact(authorities)?;
++    restore_kptr_restrict_exact(&mut authorities.kptr_restrict, expectation.original_kptr)?;
++    require_enforcing_exact(&mut authorities.selinux_enforce)?;
++    verify_installed_daemon_exact(authorities, &expectation.expected_daemon_sha256)?;
++    verify_current_path_identities(authorities)?;
++    verify_fresh_ksu_control()?;
++    require_original_kptr_exact(&mut authorities.kptr_restrict, expectation.original_kptr)?;
++
++    if let (Some(content), Some(run_id)) =
++        (receipt.as_deref(), expectation.expected_run_id.as_deref())
++    {
++        verify_receipt_exact(
++            &authorities.private_receipts,
++            "modules-loaded",
++            content,
++            0o600,
++            "trusted completion receipt",
++        )?;
++        publish_public_receipt_exact(authorities, run_id, content)?;
++        verify_receipt_exact(
++            &authorities.private_receipts,
++            "modules-loaded",
++            content,
++            0o600,
++            "trusted completion receipt",
++        )?;
++        verify_receipt_exact(
+             &authorities.public_receipts,
+-            "/data/local/tmp",
+             ".ksu-late-load-modules-ok",
+-            false,
+-        )
+-    });
+-    let enforcing = ensure_enforcing_exact(&mut authorities.selinux_enforce);
++            content,
++            0o644,
++            "public completion receipt",
++        )?;
++    }
++
++    verify_installed_daemon_exact(authorities, &expectation.expected_daemon_sha256)?;
++    verify_current_path_identities(authorities)?;
++    verify_fresh_ksu_control()?;
++    require_original_kptr_exact(&mut authorities.kptr_restrict, expectation.original_kptr)?;
++    require_enforcing_exact(&mut authorities.selinux_enforce)?;
++    info!("OnePlus Pad 3 late-load: retained-fd success finalization exact");
++    Ok(())
++}
+ 
++fn cleanup_post_load_failure(expectation: &mut PostLoadCleanupExpectation) -> Result<()> {
++    // Attempt every independent rollback before deciding whether the reserved
++    // authenticated exit may be used. A single failed proof leaves ksud on its
++    // ordinary error path and the C watcher retains its fail-stop lock.
+     let mut failures = Vec::new();
+-    if let Err(error) = kptr {
+-        failures.push(format!("kptr_restrict: {error:#}"));
++    if let Err(error) = validate_post_load_executor(expectation) {
++        failures.push(format!("executor binding: {error:#}"));
+     }
+-    if let Some(Err(error)) = trusted {
+-        failures.push(format!("trusted receipt: {error:#}"));
+-    }
+-    if let Some(Err(error)) = public {
+-        failures.push(format!("public receipt: {error:#}"));
+-    }
+-    if let Err(error) = enforcing {
+-        failures.push(format!("SELinux enforcing: {error:#}"));
++    if let Some(authorities) = expectation.authorities.as_mut() {
++        let kptr =
++            restore_kptr_restrict_exact(&mut authorities.kptr_restrict, expectation.original_kptr);
++        let trusted = expectation.cleanup_modules.then(|| {
++            unlink_sync_prove_absent(
++                &authorities.private_receipts,
++                PRIVATE_LATE_LOAD_ROOT,
++                "modules-loaded",
++                true,
++            )
++        });
++        let public = expectation.cleanup_modules.then(|| {
++            unlink_sync_prove_absent(
++                &authorities.public_receipts,
++                "/data/local/tmp",
++                ".ksu-late-load-modules-ok",
++                false,
++            )
++        });
++        let private_run = remove_private_run_exact(authorities);
++        let installed =
++            verify_installed_daemon_exact(authorities, &expectation.expected_daemon_sha256);
++        let current_paths = verify_current_path_identities(authorities);
++        let enforcing = ensure_enforcing_exact(&mut authorities.selinux_enforce);
++        if let Err(error) = kptr {
++            failures.push(format!("kptr_restrict: {error:#}"));
++        }
++        if let Some(Err(error)) = trusted {
++            failures.push(format!("trusted receipt: {error:#}"));
++        }
++        if let Some(Err(error)) = public {
++            failures.push(format!("public receipt: {error:#}"));
++        }
++        if let Err(error) = private_run {
++            failures.push(format!("private run: {error:#}"));
++        }
++        if let Err(error) = installed {
++            failures.push(format!("installed daemon: {error:#}"));
++        }
++        if let Err(error) = current_paths {
++            failures.push(format!("current path identities: {error:#}"));
++        }
++        if let Err(error) = enforcing {
++            failures.push(format!("SELinux enforcing: {error:#}"));
++        }
++    } else {
++        failures.push("post-load cleanup authority fds were not pinned after module load".into());
+     }
+     anyhow::ensure!(
+         failures.is_empty(),
+@@ -867,48 +1623,65 @@ fn run_inner(
+     let (staged_daemon, expected_daemon_sha256) = staged_daemon_handoff()?;
+     utils::stage_daemon_from(&staged_daemon, &expected_daemon_sha256)
+         .context("Failed to consume the trusted staged ksud handoff")?;
++    let (original_kptr, expected_run_id) =
++        capture_post_load_binding(&expected_daemon_sha256, run_module_scripts)
++            .context("failed to capture authenticated post-load finalization binding")?;
+ 
+-    // 1. Check if KernelSU is already loaded
+-    if ksuinit::has_kernelsu() {
+-        info!("KernelSU already loaded, skip loading ko");
+-    } else {
+-        // 2. Detect current KMI version
+-        let kmi = kmi.map_or_else(
+-            || crate::boot_patch::get_current_kmi().context("Failed to detect current KMI version"),
+-            Ok,
+-        )?;
+-        info!("Detected KMI: {kmi}");
++    // A second late-load has no safe pre-enforce finalization contract: the C
++    // caller has already exposed kallsyms, while this process has not been
++    // transitioned by module_init. Refuse it before entering the load path.
++    anyhow::ensure!(
++        !ksuinit::has_kernelsu(),
++        "KernelSU is already loaded; refusing a non-finalizing late-load replay"
++    );
+ 
+-        // 3. Get kernelsu.ko from embedded assets
+-        let ko_name = format!("{kmi}_kernelsu.ko");
+-        let ko_data = assets::get_asset_data(&ko_name)
+-            .with_context(|| format!("Failed to get {ko_name} from assets"))?;
++    // Pin every cleanup/finalization authority in the known permissive window.
++    // Publishing this expectation before init_module closes the only gap where
++    // the module could restore enforcing before the retained FDs were owned.
++    let authorities = CleanupAuthorities::pin_before_load(&staged_daemon, &expected_daemon_sha256)
++        .context("failed to pin pre-load cleanup authorities")?;
++    let expectation = cleanup_expectation.insert(PostLoadCleanupExpectation {
++        expected_daemon_sha256: expected_daemon_sha256.clone(),
++        cleanup_modules: run_module_scripts,
++        expected_run_id,
++        original_kptr,
++        module_loaded: false,
++        authorities: Some(authorities),
++    });
+ 
+-        // 4. Load kernelsu.ko from memory with manual relocation
+-        info!("Loading kernelsu.ko for KMI {kmi}...");
+-        let params = if allow_shell {
+-            cstr!("allow_shell=1")
+-        } else {
+-            cstr!("")
+-        };
+-        ksuinit::load_module(&ko_data, params).context("Failed to load kernelsu.ko")?;
+-        /* Set the expectation before any fallible post-load setup. If even an
+-         * authority fd cannot be pinned, the outer explicit error path knows
+-         * that KernelSU loaded but cannot emit the reserved cleanup proof. */
+-        *cleanup_expectation = Some(PostLoadCleanupExpectation {
+-            expected_daemon_sha256: expected_daemon_sha256.clone(),
+-            cleanup_modules: run_module_scripts,
+-            authorities: None,
+-        });
+-        let authorities = CleanupAuthorities::pin_after_load()
+-            .context("failed to pin post-load cleanup authorities")?;
+-        cleanup_expectation
+-            .as_mut()
+-            .context("post-load cleanup expectation disappeared")?
+-            .authorities = Some(authorities);
+-        info!("kernelsu.ko loaded successfully!");
+-        dump_process_info("after load_module");
+-    }
++    // 2. Detect current KMI version
++    let kmi = kmi.map_or_else(
++        || crate::boot_patch::get_current_kmi().context("Failed to detect current KMI version"),
++        Ok,
++    )?;
++    info!("Detected KMI: {kmi}");
++
++    // 3. Get kernelsu.ko from embedded assets
++    let ko_name = format!("{kmi}_kernelsu.ko");
++    let ko_data = assets::get_asset_data(&ko_name)
++        .with_context(|| format!("Failed to get {ko_name} from assets"))?;
++
++    // 4. Load kernelsu.ko from memory with manual relocation
++    info!("Loading kernelsu.ko for KMI {kmi}...");
++    let params = if allow_shell {
++        cstr!("allow_shell=1")
++    } else {
++        cstr!("")
++    };
++    ksuinit::load_module(&ko_data, params).context("Failed to load kernelsu.ko")?;
++    /* The retained expectation reference was established before init_module;
++     * the first post-return operation is this infallible state publication. */
++    expectation.module_loaded = true;
++    validate_post_load_executor(expectation)
++        .context("post-load executor did not enter the authenticated KSU domain")?;
++    expectation
++        .authorities
++        .as_mut()
++        .context("post-load retained authorities disappeared")?
++        .validate_after_load()
++        .context("post-load retained authority state is not exact")?;
++    info!("kernelsu.ko loaded successfully!");
++    dump_process_info("after load_module");
+ 
+     // Say what the module actually reports, now that it is in. Everything
+     // below can fail without KernelSU being at fault, and the caller's
+@@ -1089,18 +1862,60 @@ pub fn run(
+     modules: bool,
+ ) -> Result<()> {
+     let mut cleanup_expectation = None;
+-    match run_inner(
++    let operation = run_inner(
+         package_name,
+         kmi,
+         allow_shell,
+         modules,
+         &mut cleanup_expectation,
+-    ) {
+-        Ok(()) => Ok(()),
++    );
++    match operation {
++        Ok(()) => {
++            let Some(mut expectation) = cleanup_expectation else {
++                anyhow::bail!(
++                    "KernelSU late-load returned success without post-load finalization authorities"
++                );
++            };
++            anyhow::ensure!(
++                expectation.module_loaded,
++                "KernelSU late-load returned success before module load completed"
++            );
++            match finalize_post_load_success(&mut expectation) {
++                Ok(()) => {
++                    info!(
++                        "OnePlus Pad 3 late-load complete; emitting authenticated retained-fd success proof"
++                    );
++                    // C authenticates this reserved value with waitpid() of the
++                    // direct inode/hash-pinned loader and an empty exec-error pipe.
++                    std::process::exit(CLEAN_SUCCESS_EXIT_STATUS);
++                }
++                Err(finalization_error) => match cleanup_post_load_failure(&mut expectation) {
++                    Ok(()) => {
++                        error!(
++                            "OnePlus Pad 3 success finalization failed; exact retained-fd rollback completed: {finalization_error:#}"
++                        );
++                        exit_clean_abort();
++                    }
++                    Err(cleanup_error) => {
++                        error!(
++                            "OnePlus Pad 3 success finalization and rollback both incomplete; C watcher must remain fail-stop: finalization={finalization_error:#}; cleanup={cleanup_error:#}"
++                        );
++                        Err(finalization_error).context(format!(
++                            "post-load cleanup proof was not emitted: {cleanup_error:#}"
++                        ))
++                    }
++                },
++            }
++        }
+         Err(operation_error) => {
+             let Some(mut expectation) = cleanup_expectation else {
+                 return Err(operation_error);
+             };
++            if !expectation.module_loaded {
++                /* init_module never completed, so SELinux is still permissive
++                 * and the C parent remains the cleanup owner. */
++                return Err(operation_error);
++            }
+             match cleanup_post_load_failure(&mut expectation) {
+                 Ok(()) => {
+                     error!(
+@@ -1110,7 +1925,7 @@ pub fn run(
+                     // the direct inode/hash-pinned loader child and the empty
+                     // exec-error pipe. Panic=abort and signals never reach
+                     // this branch and therefore cannot forge cleanup proof.
+-                    std::process::exit(CLEAN_ABORT_EXIT_STATUS);
++                    exit_clean_abort();
+                 }
+                 Err(cleanup_error) => {
+                     error!(

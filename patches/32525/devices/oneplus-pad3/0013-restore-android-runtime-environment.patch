@@ -1,0 +1,327 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index 4f833207..6f21a2c2 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -232,6 +232,37 @@ const SELINUX_MAGIC: libc::c_long = 0xf97c_ff8c;
+ const VECTOR_SERVICE_LOG: &str = "/data/local/tmp/root-my-oneplus-pad3-vector-service.log";
+ const VECTOR_CLI_LOG: &str = "/data/local/tmp/root-my-oneplus-pad3-vector-cli.log";
+ const MODULE_LIFECYCLE_LOG: &str = "/data/local/tmp/root-my-oneplus-pad3-modules.log";
++const ANDROID_RUNTIME_ROOTS: [(&str, &str, u32, u32, u32); 5] = [
++    ("ANDROID_ROOT", "/system", 0, 0, 0o755),
++    ("ANDROID_DATA", "/data", 1000, 1000, 0o771),
++    (
++        "ANDROID_ART_ROOT",
++        "/apex/com.android.art",
++        1000,
++        1000,
++        0o755,
++    ),
++    (
++        "ANDROID_I18N_ROOT",
++        "/apex/com.android.i18n",
++        1000,
++        1000,
++        0o755,
++    ),
++    (
++        "ANDROID_TZDATA_ROOT",
++        "/apex/com.android.tzdata",
++        1000,
++        1000,
++        0o755,
++    ),
++];
++const ANDROID_RUNTIME_CLASSPATHS: [&str; 4] = [
++    "BOOTCLASSPATH",
++    "DEX2OATBOOTCLASSPATH",
++    "SYSTEMSERVERCLASSPATH",
++    "STANDALONE_SYSTEMSERVER_JARS",
++];
+ const VECTOR_SERVICE_MARKER: &str = "RMOP_PAD3_VECTOR_SERVICE_V3";
+ const VECTOR_AUDITED_SERVICE: &str = r#"#!/system/bin/sh
+ # RMOP_PAD3_VECTOR_SERVICE_V3
+@@ -257,6 +288,214 @@ enum VectorServiceState {
+     NeedsLaunch,
+ }
+ 
++fn validate_android_runtime_root(
++    name: &str,
++    path: &str,
++    expected_uid: u32,
++    required_group: u32,
++    expected_mode: u32,
++) -> Result<()> {
++    let metadata = fs::symlink_metadata(path)
++        .with_context(|| format!("failed to inspect fixed Android runtime root {name}"))?;
++    anyhow::ensure!(
++        metadata.file_type().is_dir(),
++        "fixed Android runtime root {name} is not a real directory"
++    );
++    anyhow::ensure!(
++        metadata.uid() == expected_uid
++            && metadata.gid() == required_group
++            && metadata.mode() & 0o777 == expected_mode,
++        "fixed Android runtime root {name} metadata is not exact"
++    );
++    anyhow::ensure!(
++        fs::canonicalize(path)
++            .with_context(|| format!("failed to canonicalize fixed Android runtime root {name}"))?
++            == Path::new(path),
++        "fixed Android runtime root {name} is not canonical"
++    );
++    Ok(())
++}
++
++fn validate_android_runtime_classpath(name: &str, value: &str) -> Result<()> {
++    anyhow::ensure!(
++        !value.is_empty() && value.len() <= 256 * 1024,
++        "authenticated zygote64 Android runtime classpath {name} has an invalid length"
++    );
++    anyhow::ensure!(
++        value
++            .bytes()
++            .all(|byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace()),
++        "authenticated zygote64 Android runtime classpath {name} contains whitespace or a control byte"
++    );
++    for entry in value.split(':') {
++        anyhow::ensure!(
++            entry.starts_with("/system/") || entry.starts_with("/apex/"),
++            "authenticated zygote64 Android runtime classpath {name} contains a path outside trusted roots"
++        );
++        let path = Path::new(entry);
++        anyhow::ensure!(
++            path.components().all(|component| matches!(
++                component,
++                std::path::Component::RootDir | std::path::Component::Normal(_)
++            )),
++            "authenticated zygote64 Android runtime classpath {name} contains a non-normal path"
++        );
++        let canonical = fs::canonicalize(path).with_context(|| {
++            format!("failed to canonicalize authenticated zygote64 {name} entry {entry}")
++        })?;
++        anyhow::ensure!(
++            canonical.starts_with("/system") || canonical.starts_with("/apex"),
++            "authenticated zygote64 Android runtime classpath {name} resolves outside trusted roots"
++        );
++        let metadata = fs::metadata(path).with_context(|| {
++            format!("failed to inspect authenticated zygote64 {name} entry {entry}")
++        })?;
++        anyhow::ensure!(
++            metadata.file_type().is_file()
++                && matches!((metadata.uid(), metadata.gid()), (0, 0) | (1000, 1000)),
++            "authenticated zygote64 Android runtime classpath {name} entry is not a trusted regular file"
++        );
++    }
++    Ok(())
++}
++
++fn authenticate_zygote64_process(proc_path: &Path) -> Result<()> {
++    let metadata = fs::metadata(proc_path).context("failed to inspect zygote64 proc directory")?;
++    anyhow::ensure!(
++        metadata.file_type().is_dir(),
++        "zygote64 proc path is not a directory"
++    );
++
++    let status =
++        fs::read_to_string(proc_path.join("status")).context("failed to read zygote64 status")?;
++    let exact_ids = |prefix: &str| {
++        status
++            .lines()
++            .find_map(|line| line.strip_prefix(prefix))
++            .is_some_and(|ids| ids.split_whitespace().eq(["0", "0", "0", "0"]))
++    };
++    anyhow::ensure!(
++        exact_ids("Uid:") && exact_ids("Gid:"),
++        "zygote64 credentials are not exact root:root"
++    );
++    anyhow::ensure!(
++        fs::read(proc_path.join("attr/current"))? == b"u:r:zygote:s0\0",
++        "zygote64 SELinux context is not exact"
++    );
++    let cmdline = fs::read(proc_path.join("cmdline")).context("failed to read zygote64 cmdline")?;
++    anyhow::ensure!(
++        cmdline.split(|byte| *byte == 0).next() == Some(b"zygote64".as_slice()),
++        "zygote64 argv[0] is not exact"
++    );
++    let expected_exe = fs::metadata("/system/bin/app_process64")
++        .context("failed to inspect trusted app_process64")?;
++    let process_exe =
++        fs::metadata(proc_path.join("exe")).context("failed to inspect zygote64 executable")?;
++    anyhow::ensure!(
++        expected_exe.file_type().is_file()
++            && expected_exe.uid() == 0
++            && expected_exe.dev() == process_exe.dev()
++            && expected_exe.ino() == process_exe.ino(),
++        "zygote64 executable is not the trusted /system/bin/app_process64 inode"
++    );
++    Ok(())
++}
++
++fn trusted_zygote64_android_classpaths() -> Result<Vec<(&'static str, String)>> {
++    let authenticated = process_ids("zygote64")
++        .into_iter()
++        .filter_map(|pid| {
++            let proc_path = Path::new("/proc").join(pid.to_string());
++            authenticate_zygote64_process(&proc_path)
++                .is_ok()
++                .then_some(proc_path)
++        })
++        .collect::<Vec<_>>();
++    anyhow::ensure!(
++        authenticated.len() == 1,
++        "expected exactly one authenticated zygote64, found {}",
++        authenticated.len()
++    );
++    let proc_path = &authenticated[0];
++    let bytes = fs::read(proc_path.join("environ"))
++        .context("failed to read authenticated zygote64 environment")?;
++    anyhow::ensure!(
++        bytes.len() <= 1024 * 1024,
++        "authenticated zygote64 environment is unexpectedly large"
++    );
++    anyhow::ensure!(
++        !bytes.is_empty() && bytes.last() == Some(&0),
++        "authenticated zygote64 environment is empty or not NUL terminated"
++    );
++
++    let mut selected = Vec::new();
++    for entry in bytes
++        .split(|byte| *byte == 0)
++        .filter(|entry| !entry.is_empty())
++    {
++        let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
++            continue;
++        };
++        let Ok(name) = std::str::from_utf8(&entry[..separator]) else {
++            continue;
++        };
++        let Some(name) = ANDROID_RUNTIME_CLASSPATHS
++            .iter()
++            .copied()
++            .find(|allowed| *allowed == name)
++        else {
++            continue;
++        };
++        let value = std::str::from_utf8(&entry[separator + 1..])
++            .with_context(|| format!("authenticated zygote64 classpath {name} is not UTF-8"))?;
++        anyhow::ensure!(
++            !selected
++                .iter()
++                .any(|(selected_name, _)| *selected_name == name),
++            "authenticated zygote64 classpath {name} is duplicated"
++        );
++        validate_android_runtime_classpath(name, value)?;
++        selected.push((name, value.to_owned()));
++    }
++    anyhow::ensure!(
++        selected.len() == ANDROID_RUNTIME_CLASSPATHS.len()
++            && ANDROID_RUNTIME_CLASSPATHS
++                .iter()
++                .all(|required| selected.iter().any(|(name, _)| name == required)),
++        "authenticated zygote64 environment lacks one or more mandatory Android classpaths"
++    );
++    authenticate_zygote64_process(proc_path)
++        .context("zygote64 identity changed while its environment was captured")?;
++    Ok(selected)
++}
++
++fn restore_android_runtime_environment() -> Result<()> {
++    for (name, path, uid, gid, mode) in ANDROID_RUNTIME_ROOTS {
++        validate_android_runtime_root(name, path, uid, gid, mode)?;
++    }
++    let classpaths = trusted_zygote64_android_classpaths()?;
++
++    // The exploit helper intentionally has a sealed minimal environment. Drop
++    // any inherited classpath values and rebuild only the fixed Android roots
++    // plus classpaths authenticated from the exact running zygote64.
++    unsafe {
++        for name in ANDROID_RUNTIME_CLASSPATHS {
++            std::env::remove_var(name);
++        }
++        for (name, path, _, _, _) in ANDROID_RUNTIME_ROOTS {
++            std::env::set_var(name, path);
++        }
++        for (name, value) in &classpaths {
++            std::env::set_var(name, value);
++        }
++    }
++    info!(
++        "OnePlus Pad 3 late-load: restored five validated Android runtime roots and {} authenticated zygote64 classpaths",
++        classpaths.len()
++    );
++    Ok(())
++}
++
+ fn staged_daemon_handoff() -> Result<(PathBuf, String)> {
+     let staged_path = std::env::var_os(STAGED_DAEMON_PATH_ENV)
+         .map(PathBuf::from)
+@@ -1558,8 +1797,8 @@ fn create_public_log_exact(path: &str, label: &str) -> Result<File> {
+                 "failed public log temporary pathname",
+             )
+             && let Ok(metadata) = file.metadata()
+-            && path_metadata.st_dev as u64 == metadata.dev()
+-            && path_metadata.st_ino as u64 == metadata.ino()
++            && path_metadata.st_dev == metadata.dev()
++            && path_metadata.st_ino == metadata.ino()
+         {
+             let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary_c.as_ptr(), 0) };
+             let _ = directory.sync_all();
+@@ -1644,10 +1883,10 @@ fn process_has_known_vector_credentials(proc_path: &Path) -> bool {
+     let Some(gids) = credentials("Gid:") else {
+         return false;
+     };
+-    let known_uids =
++    let known_user_ids =
+         uids.as_slice() == ["0", "0", "0", "0"] || uids.as_slice() == ["0", "1000", "0", "1000"];
+-    let known_gids = gids.as_slice() == ["0", "0", "0", "0"];
+-    known_uids && known_gids
++    let known_group_ids = gids.as_slice() == ["0", "0", "0", "0"];
++    known_user_ids && known_group_ids
+ }
+ 
+ fn process_is_authenticated_vector_daemon(
+@@ -1948,7 +2187,7 @@ fn verify_vector_framework_cli() -> Result<()> {
+                 last_status = format!(
+                     "per-call timeout; output={}",
+                     output.trim().chars().take(3072).collect::<String>()
+-                )
++                );
+             }
+         }
+         thread::sleep(Duration::from_millis(250));
+@@ -2352,6 +2591,8 @@ pub fn retry_modules(package_name: &str, run_id: &str, expected_ksud_sha256: &st
+     // process and are visible to zygote/system_server.
+     utils::switch_mnt_ns(1).context("failed to rejoin init mount namespace for module retry")?;
+     utils::reset_std().context("failed to reset stdio after joining init mount namespace")?;
++    restore_android_runtime_environment()
++        .context("failed to restore Android runtime environment for module retry")?;
+     utils::umask(0);
+     ensure_private_receipt_directory()?;
+ 
+@@ -2507,7 +2748,7 @@ fn dump_process_info(label: &str) {
+ }
+ 
+ fn run_inner(
+-    package_name: &String,
++    package_name: &str,
+     kmi: Option<String>,
+     allow_shell: bool,
+     modules: bool,
+@@ -2653,6 +2894,8 @@ fn run_inner(
+     // We need to reset stdin/stdout/stderr; otherwise, sending file descriptors via cmd transactions
+     // will be blocked by SELinux because its fsec->sid is still u:r:su:s0 instead of u:r:ksu:s0.
+     utils::reset_std()?;
++    restore_android_runtime_environment()
++        .context("failed to restore Android runtime environment for late-load modules")?;
+ 
+     utils::umask(0);
+ 
+@@ -2747,7 +2990,7 @@ fn run_inner(
+ }
+ 
+ pub fn run(
+-    package_name: &String,
++    package_name: &str,
+     kmi: Option<String>,
+     allow_shell: bool,
+     modules: bool,

@@ -1,0 +1,144 @@
+diff --git a/userspace/ksud/src/init_event.rs b/userspace/ksud/src/init_event.rs
+index 8f7eaac3..0a6000f0 100644
+--- a/userspace/ksud/src/init_event.rs
++++ b/userspace/ksud/src/init_event.rs
+@@ -162,6 +162,40 @@ pub fn run_stage_except_module(stage: &str, block: bool, excluded_module: Option
+     }
+ }
+ 
++/// Strict stage dispatcher for late-load completion contracts.
++///
++/// Non-blocking stages still spawn their scripts and return immediately, but
++/// every common, metamodule, and regular-module dispatch error is propagated
++/// to the caller instead of being reduced to a warning.
++pub fn run_stage_checked(stage: &str, block: bool) -> Result<()> {
++    run_stage_except_module_checked(stage, block, None)
++}
++
++pub fn run_stage_except_module_checked(
++    stage: &str,
++    block: bool,
++    excluded_module: Option<&str>,
++) -> Result<()> {
++    utils::umask(0);
++
++    anyhow::ensure!(
++        !utils::has_magisk(),
++        "Magisk detected, refusing checked {stage} stage"
++    );
++    anyhow::ensure!(
++        !crate::utils::is_safe_mode(),
++        "safe mode active, refusing checked {stage} stage"
++    );
++
++    crate::module::exec_common_scripts(&format!("{stage}.d"), block)
++        .with_context(|| format!("failed to dispatch common {stage} scripts"))?;
++    metamodule::exec_stage_script(stage, block)
++        .with_context(|| format!("failed to dispatch metamodule {stage} script"))?;
++    crate::module::exec_stage_script_except(stage, block, excluded_module)
++        .with_context(|| format!("failed to dispatch module {stage} scripts"))?;
++    Ok(())
++}
++
+ /// Run the module stage used by the explicit late-load compatibility mode.
+ ///
+ /// General scripts deliberately stay on `late-load.d`: silently replaying the
+@@ -170,32 +204,25 @@ pub fn run_stage_except_module(stage: &str, block: bool, excluded_module: Option
+ /// preferred and `post-fs-data.sh` is used only when no late-load-specific
+ /// script exists. This preserves the normal pre-mount ordering without double
+ /// starting modules that already know how to late-load.
+-pub fn run_late_load_compat_stage() {
++pub fn run_late_load_compat_stage() -> Result<()> {
+     utils::umask(0);
+ 
+-    if utils::has_magisk() {
+-        warn!("Magisk detected, skip late-load compatibility stage");
+-        return;
+-    }
+-
+-    if crate::utils::is_safe_mode() {
+-        warn!("safe mode, skip late-load compatibility scripts");
+-        return;
+-    }
+-
+-    if let Err(e) = crate::module::exec_common_scripts("late-load.d", true) {
+-        warn!("Failed to exec common late-load scripts: {e}");
+-    }
+-
+-    if let Err(e) = metamodule::exec_stage_script_with_fallback("late-load", "post-fs-data", true) {
+-        warn!("Failed to exec metamodule late-load compatibility script: {e}");
+-    }
+-
+-    if let Err(e) =
+-        crate::module::exec_stage_script_with_fallback("late-load", "post-fs-data", true)
+-    {
+-        warn!("Failed to exec module late-load compatibility scripts: {e}");
+-    }
++    anyhow::ensure!(
++        !utils::has_magisk(),
++        "Magisk detected, refusing late-load compatibility stage"
++    );
++    anyhow::ensure!(
++        !crate::utils::is_safe_mode(),
++        "safe mode active, refusing late-load compatibility stage"
++    );
++
++    crate::module::exec_common_scripts("late-load.d", true)
++        .context("failed to execute common late-load scripts")?;
++    metamodule::exec_stage_script_with_fallback("late-load", "post-fs-data", true)
++        .context("failed to execute metamodule late-load compatibility script")?;
++    crate::module::exec_stage_script_with_fallback("late-load", "post-fs-data", true)
++        .context("failed to execute module late-load compatibility scripts")?;
++    Ok(())
+ }
+ 
+ pub fn on_services() {
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index a0893ed7..00994cd8 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -508,7 +508,7 @@ pub fn run(
+     // intentionally not replayed. The Asteroids device patch recreates the
+     // zygote-start boundary after post-mount, before service.sh.
+     if run_module_scripts {
+-        init_event::run_late_load_compat_stage();
++        init_event::run_late_load_compat_stage()?;
+     } else {
+         warn!(
+             "late-load: skipping module stage scripts (pass --modules or set KSU_LATE_LOAD_MODULES=1)"
+@@ -527,7 +527,7 @@ pub fn run(
+ 
+     // 11. Execute post-mount stage scripts (blocking)
+     if run_module_scripts {
+-        init_event::run_stage("post-mount", true);
++        init_event::run_stage_checked("post-mount", true)?;
+     }
+ 
+     // 12. Execute service stage scripts (non-blocking)
+@@ -537,7 +537,7 @@ pub fn run(
+             // Common and metamodule service stages still execute normally. The
+             // stock Vector service is replaced, rather than replayed, so every
+             // module receives exactly one service-stage launch.
+-            init_event::run_stage_except_module("service", false, Some(VECTOR_MODULE_ID));
++            init_event::run_stage_except_module_checked("service", false, Some(VECTOR_MODULE_ID))?;
+             launch_vector_adapter()?;
+             wait_vector_root_daemon()?;
+             Path::new(VECTOR_DIR)
+@@ -546,7 +546,7 @@ pub fn run(
+                 .then(mark_vector_verification_log)
+                 .transpose()?
+         } else {
+-            init_event::run_stage("service", false);
++            init_event::run_stage_checked("service", false)?;
+             thread::sleep(Duration::from_millis(1000));
+             None
+         };
+@@ -558,7 +558,7 @@ pub fn run(
+ 
+     // 13. Execute boot-completed stage scripts (non-blocking)
+     if run_module_scripts {
+-        init_event::run_stage("boot-completed", false);
++        init_event::run_stage_checked("boot-completed", false)?;
+         write_module_completion_marker()?;
+     }
+ 

@@ -1,0 +1,272 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index 687b0b1a..fefd5ace 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -4,7 +4,7 @@ use rustix::cstr;
+ use std::fs;
+ use std::os::unix::fs::PermissionsExt;
+ use std::os::unix::process::CommandExt;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::process::Command;
+ use std::thread;
+ use std::time::{Duration, Instant};
+@@ -93,9 +93,27 @@ const VECTOR_DIR: &str = "/data/adb/modules/zygisk_vector";
+ const VECTOR_SOCKET: &str = "/data/adb/lspd/.cli_sock";
+ const MODULE_COMPLETION_MARKER: &str = "/data/local/tmp/.ksu-late-load-modules-ok";
+ const COMPLETION_SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
++const STAGED_DAEMON_PATH_ENV: &str = "KSU_LATE_LOAD_STAGED_DAEMON";
++const STAGED_DAEMON_SHA256_ENV: &str = "KSU_LATE_LOAD_STAGED_SHA256";
+ const VECTOR_ADAPTER_SCRIPT: &str =
+     r#"/system/bin/mount -o rslave none / || exit 1; exec "$1" --system-server-max-retry=3"#;
+ 
++fn staged_daemon_handoff() -> Result<(PathBuf, String)> {
++    let staged_path = std::env::var_os(STAGED_DAEMON_PATH_ENV)
++        .map(PathBuf::from)
++        .context("trusted staged-daemon path was not supplied by the late-load helper")?;
++    let expected_sha256 = std::env::var(STAGED_DAEMON_SHA256_ENV)
++        .context("trusted staged-daemon SHA-256 was not supplied by the late-load helper")?;
++    anyhow::ensure!(
++        expected_sha256.len() == 64
++            && expected_sha256
++                .bytes()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
++        "trusted staged-daemon SHA-256 is not 64 lowercase hex characters"
++    );
++    Ok((staged_path, expected_sha256))
++}
++
+ fn require_vector_regular_executable(path: &Path, label: &str) -> Result<()> {
+     let metadata = fs::symlink_metadata(path)
+         .with_context(|| format!("Vector {label} is missing: {}", path.display()))?;
+@@ -400,9 +418,12 @@ pub fn run(
+         clear_module_completion_marker()?;
+     }
+ 
+-    // Copy the daemon before loading the module changes this process's
+-    // security context. The remaining install steps require KernelSU policy.
+-    utils::stage_daemon_from("/data/local/tmp/.ksud-stage").context("Failed to stage ksud")?;
++    // Consume only the helper's root-private, build-pinned handoff. A public
++    // /data/local/tmp pathname can be replaced between validation and rename.
++    // The remaining install steps require KernelSU policy.
++    let (staged_daemon, expected_daemon_sha256) = staged_daemon_handoff()?;
++    utils::stage_daemon_from(&staged_daemon, &expected_daemon_sha256)
++        .context("Failed to consume the trusted staged ksud handoff")?;
+ 
+     // 1. Check if KernelSU is already loaded
+     if ksuinit::has_kernelsu() {
+diff --git a/userspace/ksud/src/utils.rs b/userspace/ksud/src/utils.rs
+index f8e5f393..78f979bd 100644
+--- a/userspace/ksud/src/utils.rs
++++ b/userspace/ksud/src/utils.rs
+@@ -1,13 +1,12 @@
+ use anyhow::{Context, Error, Ok, Result, bail};
+-use rustix::fs::{Mode, OFlags, chown, open};
++use rustix::fs::{Mode, OFlags, open};
+ use rustix::process::setpgid;
+ use rustix::stdio::{dup2_stderr, dup2_stdin, dup2_stdout};
+-use rustix::thread::{Gid, Uid};
+ use std::{
+     fs::{File, OpenOptions, create_dir_all, remove_file, write},
+     io::{
+         ErrorKind::{AlreadyExists, NotFound},
+-        Write,
++        Read, Write,
+     },
+     path::Path,
+     process::Command,
+@@ -17,7 +16,7 @@ use crate::{assets, boot_patch, defs, ksucalls, module, restorecon};
+ #[allow(unused_imports)]
+ use std::fs::{Permissions, set_permissions};
+ #[cfg(unix)]
+-use std::os::unix::prelude::PermissionsExt;
++use std::os::unix::prelude::{MetadataExt, PermissionsExt};
+ 
+ use std::path::PathBuf;
+ 
+@@ -208,19 +207,177 @@ pub fn stage_daemon() -> Result<()> {
+     Ok(())
+ }
+ 
+-pub fn stage_daemon_from(staged_exe: impl AsRef<Path>) -> Result<()> {
+-    ensure_dir_exists(defs::ADB_DIR)?;
++const PRIVATE_LATE_LOAD_ROOT: &str = "/data/adb/.rmop-late-load";
++const MAX_STAGED_DAEMON_SIZE: u64 = 64 * 1024 * 1024;
+ 
+-    std::fs::rename(staged_exe.as_ref(), defs::DAEMON_PATH).with_context(|| {
++#[cfg(unix)]
++fn validate_root_directory(path: &Path, exact_mode: Option<u32>, label: &str) -> Result<()> {
++    let metadata = std::fs::symlink_metadata(path)
++        .with_context(|| format!("Failed to inspect {label} {}", path.display()))?;
++    anyhow::ensure!(
++        metadata.file_type().is_dir(),
++        "{label} is not a real directory: {}",
++        path.display()
++    );
++    anyhow::ensure!(
++        metadata.uid() == 0 && metadata.gid() == 0,
++        "{label} is not root:root: {}",
++        path.display()
++    );
++    let mode = metadata.mode() & 0o777;
++    if let Some(expected) = exact_mode {
++        anyhow::ensure!(
++            mode == expected,
++            "{label} mode is {mode:o}, expected {expected:o}: {}",
++            path.display()
++        );
++    } else {
++        anyhow::ensure!(
++            mode & 0o022 == 0,
++            "{label} is group/other writable (mode {mode:o}): {}",
++            path.display()
++        );
++    }
++    Ok(())
++}
++
++#[cfg(unix)]
++fn validate_staged_metadata(
++    metadata: &std::fs::Metadata,
++    expected_mode: u32,
++    label: &str,
++) -> Result<()> {
++    anyhow::ensure!(
++        metadata.file_type().is_file(),
++        "{label} is not a regular file"
++    );
++    anyhow::ensure!(
++        metadata.uid() == 0 && metadata.gid() == 0,
++        "{label} is not root:root"
++    );
++    let mode = metadata.mode() & 0o777;
++    anyhow::ensure!(
++        mode == expected_mode,
++        "{label} mode is {mode:o}, expected {expected_mode:o}"
++    );
++    anyhow::ensure!(
++        metadata.len() > 0 && metadata.len() <= MAX_STAGED_DAEMON_SIZE,
++        "{label} size {} is outside 1..={MAX_STAGED_DAEMON_SIZE}",
++        metadata.len()
++    );
++    Ok(())
++}
++
++#[cfg(unix)]
++fn digest_open_daemon(
++    file: &mut File,
++    metadata: &std::fs::Metadata,
++    label: &str,
++) -> Result<String> {
++    let capacity = usize::try_from(metadata.len()).context("staged daemon size overflow")?;
++    let mut bytes = Vec::with_capacity(capacity);
++    file.read_to_end(&mut bytes)
++        .with_context(|| format!("Failed to read {label}"))?;
++    anyhow::ensure!(
++        bytes.len() as u64 == metadata.len(),
++        "{label} changed size while hashing"
++    );
++    Ok(sha256::digest(bytes.as_slice()))
++}
++
++#[cfg(unix)]
++pub fn stage_daemon_from(staged_exe: impl AsRef<Path>, expected_sha256: &str) -> Result<()> {
++    let staged_exe = staged_exe.as_ref();
++    let private_root = Path::new(PRIVATE_LATE_LOAD_ROOT);
++    let run_dir = staged_exe
++        .parent()
++        .context("trusted staged daemon has no parent directory")?;
++    anyhow::ensure!(
++        staged_exe.is_absolute()
++            && staged_exe
++                .file_name()
++                .is_some_and(|name| name == "ksud-stage")
++            && run_dir.parent() == Some(private_root)
++            && run_dir.file_name().is_some_and(|name| {
++                let name = name.as_encoded_bytes();
++                !name.is_empty() && name.iter().all(u8::is_ascii_digit)
++            }),
++        "staged daemon is outside the trusted per-run path: {}",
++        staged_exe.display()
++    );
++    anyhow::ensure!(
++        expected_sha256.len() == 64
++            && expected_sha256
++                .bytes()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
++        "expected staged-daemon SHA-256 is not 64 lowercase hex characters"
++    );
++
++    ensure_dir_exists(defs::ADB_DIR)?;
++    let daemon_parent = Path::new(defs::DAEMON_PATH)
++        .parent()
++        .context("installed daemon has no parent directory")?;
++    validate_root_directory(daemon_parent, None, "KernelSU data directory")?;
++    validate_root_directory(private_root, Some(0o700), "late-load private root")?;
++    validate_root_directory(run_dir, Some(0o700), "late-load private run directory")?;
++
++    let source_fd = open(
++        staged_exe,
++        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
++        Mode::empty(),
++    )
++    .with_context(|| format!("Failed to open trusted stage {}", staged_exe.display()))?;
++    let mut source = File::from(source_fd);
++    let source_metadata = source.metadata().context("Failed to fstat trusted stage")?;
++    validate_staged_metadata(&source_metadata, 0o500, "trusted stage")?;
++
++    let path_metadata = std::fs::symlink_metadata(staged_exe)
++        .context("Failed to revalidate trusted stage pathname")?;
++    anyhow::ensure!(
++        path_metadata.dev() == source_metadata.dev()
++            && path_metadata.ino() == source_metadata.ino(),
++        "trusted stage pathname changed after O_NOFOLLOW open"
++    );
++    let source_sha256 = digest_open_daemon(&mut source, &source_metadata, "trusted stage")?;
++    anyhow::ensure!(
++        source_sha256 == expected_sha256,
++        "trusted stage SHA-256 mismatch: {source_sha256}"
++    );
++
++    source
++        .set_permissions(Permissions::from_mode(0o755))
++        .context("Failed to make trusted stage executable")?;
++    std::fs::rename(staged_exe, defs::DAEMON_PATH).with_context(|| {
+         format!(
+-            "Failed to rename {} to {}",
+-            staged_exe.as_ref().display(),
++            "Failed to rename trusted stage {} to {}",
++            staged_exe.display(),
+             defs::DAEMON_PATH
+         )
+     })?;
+-    chown(defs::DAEMON_PATH, Some(Uid::ROOT), Some(Gid::ROOT))?;
+-    #[cfg(unix)]
+-    set_permissions(defs::DAEMON_PATH, Permissions::from_mode(0o755))?;
++
++    let destination_fd = open(
++        defs::DAEMON_PATH,
++        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
++        Mode::empty(),
++    )
++    .with_context(|| format!("Failed to open installed daemon {}", defs::DAEMON_PATH))?;
++    let mut destination = File::from(destination_fd);
++    let destination_metadata = destination
++        .metadata()
++        .context("Failed to fstat installed daemon")?;
++    validate_staged_metadata(&destination_metadata, 0o755, "installed daemon")?;
++    anyhow::ensure!(
++        destination_metadata.dev() == source_metadata.dev()
++            && destination_metadata.ino() == source_metadata.ino()
++            && destination_metadata.len() == source_metadata.len(),
++        "installed daemon is not the inode renamed from the trusted stage"
++    );
++    let destination_sha256 =
++        digest_open_daemon(&mut destination, &destination_metadata, "installed daemon")?;
++    anyhow::ensure!(
++        destination_sha256 == expected_sha256,
++        "installed daemon SHA-256 mismatch after rename: {destination_sha256}"
++    );
+ 
+     Ok(())
+ }

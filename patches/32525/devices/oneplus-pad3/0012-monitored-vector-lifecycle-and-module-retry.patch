@@ -1,0 +1,1518 @@
+diff --git a/userspace/ksud/src/cli.rs b/userspace/ksud/src/cli.rs
+index 48cb1b0..4fd11c0 100644
+--- a/userspace/ksud/src/cli.rs
++++ b/userspace/ksud/src/cli.rs
+@@ -69,6 +69,21 @@ enum Commands {
+         package_name: String,
+     },
+ 
++    /// Retry late-load module stages without loading kernelsu.ko again
++    ModuleRetry {
++        /// App-generated current-boot completion nonce
++        #[arg(long)]
++        run_id: String,
++
++        /// SHA-256 pin of the installed ksud executing this retry
++        #[arg(long)]
++        expected_ksud_sha256: String,
++
++        /// manager package name
++        #[arg(long, default_value_t = String::from("org.witaqua.pwn.kernelsu"))]
++        package_name: String,
++    },
++
+     /// Emulate system reboot
+     SoftReboot,
+ 
+@@ -511,6 +526,12 @@ pub fn run() -> Result<()> {
+             Ok(())
+         }
+ 
++        Commands::ModuleRetry {
++            run_id,
++            expected_ksud_sha256,
++            package_name,
++        } => crate::late_load::retry_modules(&package_name, &run_id, &expected_ksud_sha256),
++
+         Commands::SoftReboot => init_event::soft_reboot(),
+ 
+         Commands::Insmod { module, params } => debug::insmod(&module, &params),
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index c12da3f..4f83320 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
+ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+ use std::os::unix::process::CommandExt;
+ use std::path::{Path, PathBuf};
+-use std::process::Command;
++use std::process::{Command, Stdio};
+ use std::thread;
+ use std::time::{Duration, Instant};
+ 
+@@ -229,8 +229,33 @@ const CLEAN_SUCCESS_EXIT_STATUS: i32 = 201;
+ const KSU_SELINUX_CONTEXT_BYTES: &[u8] = b"u:r:ksu:s0\0";
+ const PROC_SUPER_MAGIC: libc::c_long = 0x9fa0;
+ const SELINUX_MAGIC: libc::c_long = 0xf97c_ff8c;
+-const VECTOR_ADAPTER_SCRIPT: &str =
+-    r#"/system/bin/mount -o rslave none / || exit 1; exec "$1" --system-server-max-retry=3"#;
++const VECTOR_SERVICE_LOG: &str = "/data/local/tmp/root-my-oneplus-pad3-vector-service.log";
++const VECTOR_CLI_LOG: &str = "/data/local/tmp/root-my-oneplus-pad3-vector-cli.log";
++const MODULE_LIFECYCLE_LOG: &str = "/data/local/tmp/root-my-oneplus-pad3-modules.log";
++const VECTOR_SERVICE_MARKER: &str = "RMOP_PAD3_VECTOR_SERVICE_V3";
++const VECTOR_AUDITED_SERVICE: &str = r#"#!/system/bin/sh
++# RMOP_PAD3_VECTOR_SERVICE_V3
++MODDIR="${0%/*}"
++cd "$MODDIR" || exit 1
++
++# Android toybox unshare has no util-linux --propagation option. Enter a mount
++# namespace first, make its root recursively slave with Android's mount, then
++# keep the daemon as the monitored child. Absolute paths avoid BusyBox applet
++# resolution differences in KernelSU's module-script environment.
++exec /system/bin/unshare -m /system/bin/sh -c '
++    /system/bin/mount -o rslave none / || exit 1
++    DAEMON="$1"
++    shift
++    exec "$DAEMON" --system-server-max-retry=3 "$@"
++' sh "$MODDIR/daemon" "$@"
++"#;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum VectorServiceState {
++    Disabled,
++    Running,
++    NeedsLaunch,
++}
+ 
+ fn staged_daemon_handoff() -> Result<(PathBuf, String)> {
+     let staged_path = std::env::var_os(STAGED_DAEMON_PATH_ENV)
+@@ -256,6 +281,11 @@ fn require_vector_regular_executable(path: &Path, label: &str) -> Result<()> {
+         "Vector {label} is not a regular file: {}",
+         path.display()
+     );
++    anyhow::ensure!(
++        metadata.uid() == 0 && metadata.gid() == 0,
++        "Vector {label} is not root:root: {}",
++        path.display()
++    );
+     anyhow::ensure!(
+         metadata.permissions().mode() & 0o111 != 0,
+         "Vector {label} is not executable: {}",
+@@ -264,7 +294,7 @@ fn require_vector_regular_executable(path: &Path, label: &str) -> Result<()> {
+     Ok(())
+ }
+ 
+-fn require_vector_regular_script(path: &Path, label: &str) -> Result<()> {
++fn require_vector_regular_file(path: &Path, label: &str) -> Result<()> {
+     let metadata = fs::symlink_metadata(path)
+         .with_context(|| format!("Vector {label} is missing: {}", path.display()))?;
+     anyhow::ensure!(
+@@ -272,52 +302,69 @@ fn require_vector_regular_script(path: &Path, label: &str) -> Result<()> {
+         "Vector {label} is not a regular file: {}",
+         path.display()
+     );
++    anyhow::ensure!(
++        metadata.uid() == 0 && metadata.gid() == 0,
++        "Vector {label} is not root:root: {}",
++        path.display()
++    );
+     Ok(())
+ }
+ 
+-fn vector_adapter_requested() -> Result<bool> {
++fn vector_module_enabled() -> bool {
+     let module_dir = Path::new(VECTOR_DIR);
+-    if !module_dir.is_dir()
+-        || module_dir.join("disable").exists()
+-        || module_dir.join("remove").exists()
+-    {
+-        info!("OnePlus Pad 3 late-load: Vector adapter skipped; module is unavailable or disabled");
+-        return Ok(false);
+-    }
++    module_dir.is_dir()
++        && !module_dir.join("disable").exists()
++        && !module_dir.join("remove").exists()
++}
+ 
+-    let vector_dir = fs::canonicalize(module_dir).context("failed to resolve the Vector module")?;
++fn require_vector_not_metamodule() -> Result<()> {
++    let vector_dir = fs::canonicalize(VECTOR_DIR).context("failed to resolve the Vector module")?;
+     let vector_is_metamodule = metamodule::get_metamodule_path()
+         .and_then(|path| fs::canonicalize(path).ok())
+         .as_ref()
+         == Some(&vector_dir);
+     anyhow::ensure!(
+         !vector_is_metamodule,
+-        "Vector is the active metamodule; refusing an adapter launch that would duplicate its service stage"
++        "Vector is the active metamodule; refusing a duplicate direct service launch"
+     );
++    Ok(())
++}
+ 
+-    // An enabled Vector installation is part of the requested completion
+-    // contract even when its launcher is already Android-compatible. Refuse a
+-    // partial or replaced installation instead of publishing a false marker.
+-    let service_path = module_dir.join("service.sh");
+-    let daemon_path = module_dir.join("daemon");
+-    let action_path = module_dir.join("action.sh");
+-    require_vector_regular_script(&service_path, "service entrypoint")?;
+-    require_vector_regular_executable(&daemon_path, "daemon")?;
+-    require_vector_regular_script(&action_path, "action entrypoint")?;
+-
++fn patch_vector_service_for_android_tools() -> Result<()> {
++    let service_path = Path::new(VECTOR_DIR).join("service.sh");
++    // Vector deliberately ships interpreted service/action scripts without an
++    // executable bit. Authenticate the regular root-owned source before
++    // replacing it; the audited launcher installed below is made executable.
++    require_vector_regular_file(&service_path, "service entrypoint")?;
+     let service =
+         fs::read_to_string(&service_path).context("failed to inspect Vector service.sh")?;
+-    if !service.contains("unshare --propagation") {
+-        info!(
+-            "OnePlus Pad 3 late-load: Vector stock service has no incompatible unshare --propagation launcher"
+-        );
+-        return Ok(false);
++    if service.contains(VECTOR_SERVICE_MARKER) {
++        info!("OnePlus Pad 3 late-load: Vector service launcher is already audited");
++        return Ok(());
+     }
+ 
++    // Preserve the vendor launcher once. Replacing the script rather than
++    // exec'ing daemon directly retains Vector's service entrypoint semantics
++    // while removing util-linux-only options that Android toybox rejects.
++    let backup_path = Path::new(VECTOR_DIR).join("service.sh.rmop-stock");
++    if !backup_path.exists() {
++        fs::copy(&service_path, &backup_path).context("failed to back up Vector service.sh")?;
++        let mut backup_permissions = fs::metadata(&backup_path)?.permissions();
++        backup_permissions.set_mode(0o600);
++        fs::set_permissions(&backup_path, backup_permissions)
++            .context("failed to protect Vector service backup")?;
++    }
++
++    fs::write(&service_path, VECTOR_AUDITED_SERVICE)
++        .context("failed to install audited Vector service.sh")?;
++    let mut permissions = fs::metadata(&service_path)?.permissions();
++    permissions.set_mode(0o755);
++    fs::set_permissions(&service_path, permissions)
++        .context("failed to chmod audited Vector service.sh")?;
+     info!(
+-        "OnePlus Pad 3 late-load: replacing one incompatible Vector service launch in ksud; module files remain unchanged"
++        "OnePlus Pad 3 late-load: installed monitored Vector service launcher with absolute Android tools"
+     );
+-    Ok(true)
++    Ok(())
+ }
+ 
+ fn remove_completion_path(path: &str, label: &str) -> Result<()> {
+@@ -1137,11 +1184,11 @@ fn verify_receipt_exact(
+ }
+ 
+ fn publish_public_receipt_exact(
+-    authorities: &CleanupAuthorities,
++    public_receipts: &File,
+     run_id: &str,
+     content: &[u8],
+ ) -> Result<()> {
+-    validate_cleanup_directory(&authorities.public_receipts, false)?;
++    validate_cleanup_directory(public_receipts, false)?;
+     let temp_name = format!(
+         ".ksu-late-load-modules-ok.tmp.{}.{}",
+         std::process::id(),
+@@ -1153,7 +1200,7 @@ fn publish_public_receipt_exact(
+         CString::new(".ksu-late-load-modules-ok").context("public receipt name contains NUL")?;
+     let fd = unsafe {
+         libc::openat(
+-            authorities.public_receipts.as_raw_fd(),
++            public_receipts.as_raw_fd(),
+             temp_c.as_ptr(),
+             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+             0o600,
+@@ -1190,7 +1237,7 @@ fn publish_public_receipt_exact(
+             "public receipt temporary metadata is not exact"
+         );
+         let path = fstatat_raw(
+-            &authorities.public_receipts,
++            public_receipts,
+             &temp_name,
+             "public receipt temporary pathname",
+         )?;
+@@ -1200,9 +1247,9 @@ fn publish_public_receipt_exact(
+         );
+         let renamed = unsafe {
+             libc::renameat(
+-                authorities.public_receipts.as_raw_fd(),
++                public_receipts.as_raw_fd(),
+                 temp_c.as_ptr(),
+-                authorities.public_receipts.as_raw_fd(),
++                public_receipts.as_raw_fd(),
+                 final_c.as_ptr(),
+             )
+         };
+@@ -1210,12 +1257,11 @@ fn publish_public_receipt_exact(
+             return Err(std::io::Error::last_os_error())
+                 .context("failed to atomically publish public receipt");
+         }
+-        authorities
+-            .public_receipts
++        public_receipts
+             .sync_all()
+             .context("failed to sync public receipt directory")?;
+         verify_receipt_exact(
+-            &authorities.public_receipts,
++            public_receipts,
+             ".ksu-late-load-modules-ok",
+             content,
+             0o644,
+@@ -1224,8 +1270,7 @@ fn publish_public_receipt_exact(
+         let path_identity = open_cleanup_directory("/data/local/tmp", false)?
+             .metadata()
+             .context("failed to recheck public receipt directory identity")?;
+-        let retained_identity = authorities
+-            .public_receipts
++        let retained_identity = public_receipts
+             .metadata()
+             .context("failed to fstat retained public receipt directory")?;
+         anyhow::ensure!(
+@@ -1237,7 +1282,7 @@ fn publish_public_receipt_exact(
+     })();
+     if result.is_err()
+         && let Ok(path) = fstatat_raw(
+-            &authorities.public_receipts,
++            public_receipts,
+             &temp_name,
+             "failed public receipt temporary pathname",
+         )
+@@ -1245,9 +1290,8 @@ fn publish_public_receipt_exact(
+         && path.st_dev == metadata.dev()
+         && path.st_ino == metadata.ino()
+     {
+-        let _ =
+-            unsafe { libc::unlinkat(authorities.public_receipts.as_raw_fd(), temp_c.as_ptr(), 0) };
+-        let _ = authorities.public_receipts.sync_all();
++        let _ = unsafe { libc::unlinkat(public_receipts.as_raw_fd(), temp_c.as_ptr(), 0) };
++        let _ = public_receipts.sync_all();
+     }
+     result
+ }
+@@ -1311,7 +1355,7 @@ fn finalize_post_load_success(expectation: &mut PostLoadCleanupExpectation) -> R
+             0o600,
+             "trusted completion receipt",
+         )?;
+-        publish_public_receipt_exact(authorities, run_id, content)?;
++        publish_public_receipt_exact(&authorities.public_receipts, run_id, content)?;
+         verify_receipt_exact(
+             &authorities.private_receipts,
+             "modules-loaded",
+@@ -1401,6 +1445,179 @@ fn cleanup_post_load_failure(expectation: &mut PostLoadCleanupExpectation) -> Re
+     Ok(())
+ }
+ 
++fn public_log_name(path: &str, label: &str) -> Result<String> {
++    let path = Path::new(path);
++    anyhow::ensure!(
++        path.parent() == Some(Path::new("/data/local/tmp")),
++        "{label} is outside /data/local/tmp"
++    );
++    let name = path
++        .file_name()
++        .and_then(|value| value.to_str())
++        .with_context(|| format!("{label} has no UTF-8 filename"))?;
++    anyhow::ensure!(
++        !name.is_empty()
++            && name
++                .bytes()
++                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') }),
++        "{label} filename is not a safe fixed name"
++    );
++    Ok(name.to_owned())
++}
++
++/// Create a public diagnostic log without following a shell-controlled path.
++///
++/// `/data/local/tmp` belongs to shell, so `File::create(path)` would permit a
++/// pre-existing symlink to redirect a root write. Create and authenticate a
++/// root-owned inode through a retained directory FD, atomically publish it,
++/// and keep writing through that pinned FD even if shell later unlinks it.
++fn create_public_log_exact(path: &str, label: &str) -> Result<File> {
++    let name = public_log_name(path, label)?;
++    let directory = open_cleanup_directory("/data/local/tmp", false)?;
++    let final_name = CString::new(name.as_str()).context("public log name contains NUL")?;
++
++    for attempt in 0..32u32 {
++        let temporary_name = format!(".{name}.{}.{}.tmp", std::process::id(), attempt);
++        let temporary_c = CString::new(temporary_name.as_str())
++            .context("public log temporary name contains NUL")?;
++        let fd = unsafe {
++            libc::openat(
++                directory.as_raw_fd(),
++                temporary_c.as_ptr(),
++                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
++                0o600,
++            )
++        };
++        if fd < 0 {
++            let error = std::io::Error::last_os_error();
++            if error.kind() == ErrorKind::AlreadyExists {
++                continue;
++            }
++            return Err(error).with_context(|| {
++                format!("failed to create secure public log temporary file for {label}")
++            });
++        }
++        let file = unsafe { File::from_raw_fd(fd) };
++        let result = (|| -> Result<()> {
++            if unsafe { libc::fchown(file.as_raw_fd(), 0, 0) } != 0
++                || unsafe { libc::fchmod(file.as_raw_fd(), 0o644) } != 0
++            {
++                return Err(std::io::Error::last_os_error())
++                    .with_context(|| format!("failed to secure {label} inode"));
++            }
++            let metadata = file
++                .metadata()
++                .with_context(|| format!("failed to fstat {label} inode"))?;
++            anyhow::ensure!(
++                metadata.file_type().is_file()
++                    && metadata.uid() == 0
++                    && metadata.gid() == 0
++                    && metadata.mode() & 0o777 == 0o644
++                    && metadata.nlink() == 1
++                    && metadata.len() == 0,
++                "{label} temporary inode metadata is not exact"
++            );
++            let temporary_path =
++                fstatat_raw(&directory, &temporary_name, "public log temporary pathname")?;
++            anyhow::ensure!(
++                temporary_path.st_dev as u64 == metadata.dev()
++                    && temporary_path.st_ino as u64 == metadata.ino(),
++                "{label} temporary pathname was replaced"
++            );
++            if unsafe {
++                libc::renameat(
++                    directory.as_raw_fd(),
++                    temporary_c.as_ptr(),
++                    directory.as_raw_fd(),
++                    final_name.as_ptr(),
++                )
++            } != 0
++            {
++                return Err(std::io::Error::last_os_error())
++                    .with_context(|| format!("failed to atomically publish {label}"));
++            }
++            directory
++                .sync_all()
++                .with_context(|| format!("failed to sync {label} parent directory"))?;
++            let published = fstatat_raw(&directory, &name, "public log pathname")?;
++            anyhow::ensure!(
++                published.st_dev as u64 == metadata.dev()
++                    && published.st_ino as u64 == metadata.ino()
++                    && published.st_uid == 0
++                    && published.st_gid == 0
++                    && (published.st_mode as u32 & 0o777) == 0o644
++                    && u64::from(published.st_nlink) == 1,
++                "{label} published pathname is not the authenticated inode"
++            );
++            Ok(())
++        })();
++        if result.is_err()
++            && let Ok(Some(path_metadata)) = fstatat_optional(
++                &directory,
++                &temporary_name,
++                "failed public log temporary pathname",
++            )
++            && let Ok(metadata) = file.metadata()
++            && path_metadata.st_dev as u64 == metadata.dev()
++            && path_metadata.st_ino as u64 == metadata.ino()
++        {
++            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary_c.as_ptr(), 0) };
++            let _ = directory.sync_all();
++        }
++        result?;
++        return Ok(file);
++    }
++
++    anyhow::bail!("could not allocate a unique secure public log inode for {label}")
++}
++
++fn reset_module_lifecycle_log() {
++    let operation = (|| -> Result<()> {
++        let boot_id = current_boot_id().unwrap_or_else(|_| "unknown".to_owned());
++        let mut file = create_public_log_exact(MODULE_LIFECYCLE_LOG, "module lifecycle log")?;
++        writeln!(file, "boot_id={boot_id} pid={}", std::process::id())
++            .context("failed to initialize module lifecycle log")?;
++        file.sync_all()
++            .context("failed to sync initialized module lifecycle log")
++    })();
++    if let Err(error) = operation {
++        warn!("OnePlus Pad 3 late-load: failed to reset module lifecycle log: {error:#}");
++    }
++}
++
++fn append_module_lifecycle_log(message: &str) {
++    let operation = (|| -> Result<()> {
++        let name = public_log_name(MODULE_LIFECYCLE_LOG, "module lifecycle log")?;
++        let directory = open_cleanup_directory("/data/local/tmp", false)?;
++        let mut file = OpenOptions::new()
++            .append(true)
++            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
++            .open(MODULE_LIFECYCLE_LOG)
++            .context("failed to open authenticated module lifecycle log")?;
++        let metadata = file
++            .metadata()
++            .context("failed to fstat module lifecycle log")?;
++        anyhow::ensure!(
++            metadata.file_type().is_file()
++                && metadata.uid() == 0
++                && metadata.gid() == 0
++                && metadata.mode() & 0o777 == 0o644
++                && metadata.nlink() == 1,
++            "module lifecycle log metadata is not exact"
++        );
++        let path_metadata = fstatat_raw(&directory, &name, "module lifecycle log pathname")?;
++        anyhow::ensure!(
++            path_metadata.st_dev as u64 == metadata.dev()
++                && path_metadata.st_ino as u64 == metadata.ino(),
++            "module lifecycle log pathname no longer names the opened inode"
++        );
++        writeln!(file, "{message}").context("failed to append module lifecycle log")
++    })();
++    if let Err(error) = operation {
++        warn!("OnePlus Pad 3 late-load: failed to write module lifecycle log: {error:#}");
++    }
++}
++
+ fn vector_socket_registered() -> bool {
+     fs::read_to_string("/proc/net/unix")
+         .map(|table| {
+@@ -1411,20 +1628,155 @@ fn vector_socket_registered() -> bool {
+         .unwrap_or(false)
+ }
+ 
+-fn launch_vector_adapter() -> Result<()> {
+-    if vector_socket_registered() {
+-        info!("OnePlus Pad 3 late-load: reusing the registered Vector root-daemon socket");
++fn process_has_known_vector_credentials(proc_path: &Path) -> bool {
++    let Ok(status) = fs::read_to_string(proc_path.join("status")) else {
++        return false;
++    };
++    let credentials = |prefix: &str| {
++        status
++            .lines()
++            .find_map(|line| line.strip_prefix(prefix))
++            .map(|values| values.split_whitespace().collect::<Vec<_>>())
++    };
++    let Some(uids) = credentials("Uid:") else {
++        return false;
++    };
++    let Some(gids) = credentials("Gid:") else {
++        return false;
++    };
++    let known_uids =
++        uids.as_slice() == ["0", "0", "0", "0"] || uids.as_slice() == ["0", "1000", "0", "1000"];
++    let known_gids = gids.as_slice() == ["0", "0", "0", "0"];
++    known_uids && known_gids
++}
++
++fn process_is_authenticated_vector_daemon(
++    proc_path: &Path,
++    vector_directory: &fs::Metadata,
++) -> bool {
++    if !process_has_known_vector_credentials(proc_path) {
++        return false;
++    }
++    let Ok(cwd) = fs::metadata(proc_path.join("cwd")) else {
++        return false;
++    };
++    if cwd.dev() != vector_directory.dev() || cwd.ino() != vector_directory.ino() {
++        return false;
++    }
++
++    let exact_comm = fs::read(proc_path.join("comm")).is_ok_and(|comm| comm == b"vectord\n");
++    let exact_argv = fs::read(proc_path.join("cmdline")).is_ok_and(|cmdline| {
++        cmdline.split(|byte| *byte == 0).any(|argument| {
++            argument == b"/data/adb/modules/zygisk_vector/daemon"
++                || argument == b"org.matrix.vector.daemon.VectorDaemon"
++        })
++    });
++    let daemon_apk = format!("{VECTOR_DIR}/daemon.apk");
++    let exact_map = fs::read_to_string(proc_path.join("maps")).is_ok_and(|maps| {
++        maps.lines()
++            .any(|line| line.split_whitespace().last() == Some(daemon_apk.as_str()))
++    });
++    exact_comm || exact_argv || exact_map
++}
++
++fn stop_stale_vector_launcher() -> Result<()> {
++    let vector_directory = fs::metadata(VECTOR_DIR)
++        .context("failed to authenticate Vector directory before stale-daemon cleanup")?;
++    anyhow::ensure!(
++        vector_directory.file_type().is_dir()
++            && vector_directory.uid() == 0
++            && vector_directory.gid() == 0,
++        "Vector directory is not an exact root:root directory"
++    );
++    let Ok(entries) = fs::read_dir("/proc") else {
++        anyhow::bail!("failed to enumerate /proc while checking stale Vector daemons");
++    };
++    let mut stale_pids = Vec::new();
++    for entry in entries.flatten() {
++        let Some(pid) = entry
++            .file_name()
++            .to_str()
++            .and_then(|value| value.parse::<u32>().ok())
++        else {
++            continue;
++        };
++        if !process_is_authenticated_vector_daemon(&entry.path(), &vector_directory) {
++            continue;
++        }
++        stale_pids.push(pid);
++        warn!("OnePlus Pad 3 late-load: stopping stale Vector launcher pid={pid}");
++        let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
++        if killed != 0 {
++            let error = std::io::Error::last_os_error();
++            if error.raw_os_error() != Some(libc::ESRCH) {
++                return Err(error)
++                    .with_context(|| format!("failed to kill stale Vector pid={pid}"));
++            }
++        }
++    }
++
++    if stale_pids.is_empty() {
+         return Ok(());
+     }
+ 
+-    let socket_path = Path::new(VECTOR_SOCKET);
+-    if socket_path.exists() {
+-        warn!("OnePlus Pad 3 late-load: removing stale unregistered Vector socket inode");
+-        fs::remove_file(socket_path).context("failed to remove stale Vector socket inode")?;
++    // Vector holds an advisory lock for its lifetime. Do not unlink the lock
++    // inode: wait until every positively identified owner has exited so the
++    // kernel releases the lock before starting exactly one replacement.
++    let timeout = Duration::from_secs(5);
++    let started = Instant::now();
++    while started.elapsed() < timeout {
++        stale_pids.retain(|pid| Path::new("/proc").join(pid.to_string()).exists());
++        if stale_pids.is_empty() {
++            info!("OnePlus Pad 3 late-load: stale Vector daemon owners exited");
++            return Ok(());
++        }
++        thread::sleep(Duration::from_millis(50));
++    }
++    anyhow::bail!(
++        "stale Vector daemon owners did not exit within {} seconds: {:?}",
++        timeout.as_secs(),
++        stale_pids
++    )
++}
++
++fn prepare_vector_service_stage() -> Result<VectorServiceState> {
++    if !vector_module_enabled() {
++        info!("OnePlus Pad 3 late-load: Vector lifecycle skipped; module unavailable or disabled");
++        return Ok(VectorServiceState::Disabled);
+     }
+ 
++    require_vector_not_metamodule()?;
+     let daemon_path = Path::new(VECTOR_DIR).join("daemon");
+-    let mut command = Command::new("/system/bin/unshare");
++    let cli_path = Path::new(VECTOR_DIR).join("cli");
++    require_vector_regular_executable(&daemon_path, "daemon")?;
++    require_vector_regular_executable(&cli_path, "CLI")?;
++    patch_vector_service_for_android_tools()?;
++
++    // Preserve a registered root daemon during a module-only retry. Excluding
++    // Vector from generic dispatch prevents a duplicate daemon from taking the
++    // LSPosed/Vector rendezvous socket away from the healthy instance.
++    if vector_socket_registered() {
++        info!("OnePlus Pad 3 late-load: existing Vector root-daemon socket is registered");
++        return Ok(VectorServiceState::Running);
++    }
++
++    stop_stale_vector_launcher()?;
++    if fs::symlink_metadata(VECTOR_SOCKET).is_ok() {
++        warn!("OnePlus Pad 3 late-load: removing stale unregistered Vector socket inode");
++        fs::remove_file(VECTOR_SOCKET).context("failed to remove stale Vector socket inode")?;
++    }
++    info!("OnePlus Pad 3 late-load: Vector prepared for one monitored service launch");
++    Ok(VectorServiceState::NeedsLaunch)
++}
++
++fn launch_vector_service_directly() -> Result<()> {
++    let service_path = Path::new(VECTOR_DIR).join("service.sh");
++    require_vector_regular_executable(&service_path, "service entrypoint")?;
++    let stdout = create_public_log_exact(VECTOR_SERVICE_LOG, "Vector service launcher log")?;
++    let stderr = stdout
++        .try_clone()
++        .context("failed to clone Vector service launcher log")?;
++    let mut command = Command::new("/system/bin/sh");
+     unsafe {
+         command.pre_exec(|| {
+             utils::detach_process_group(true);
+@@ -1432,152 +1784,699 @@ fn launch_vector_adapter() -> Result<()> {
+             Ok(())
+         });
+     }
+-    let child = command
++    let mut child = command
+         .current_dir(VECTOR_DIR)
+-        .args([
+-            "-m",
+-            "/system/bin/sh",
+-            "-c",
+-            VECTOR_ADAPTER_SCRIPT,
+-            "ksu-vector-adapter",
+-        ])
+-        .arg(&daemon_path)
++        .arg(&service_path)
+         .envs(crate::module::get_common_script_envs(Some(
+             VECTOR_MODULE_ID,
+         )))
++        .stdout(Stdio::from(stdout))
++        .stderr(Stdio::from(stderr))
+         .spawn()
+-        .context("failed to launch the in-ksud Vector mount-namespace adapter")?;
++        .context("failed to spawn monitored Vector service launcher")?;
+     info!(
+-        "OnePlus Pad 3 late-load: Vector adapter launched pid={} with /system/bin/unshare -m",
++        "OnePlus Pad 3 late-load: monitored Vector service launched pid={} log={VECTOR_SERVICE_LOG}",
+         child.id()
+     );
+-    Ok(())
+-}
+ 
+-fn wait_vector_root_daemon() -> Result<()> {
+     let timeout = Duration::from_secs(15);
+     let started = Instant::now();
+     while started.elapsed() < timeout {
+         if vector_socket_registered() {
+-            info!("OnePlus Pad 3 late-load: live {VECTOR_SOCKET} registration verified");
++            info!("OnePlus Pad 3 late-load: live /data/adb/lspd/.cli_sock registration verified");
++            append_module_lifecycle_log("Vector root-daemon socket registered");
+             return Ok(());
+         }
++        if let Some(status) = child
++            .try_wait()
++            .context("failed to query monitored Vector service launcher")?
++        {
++            anyhow::bail!(
++                "Vector service launcher exited {status} before registering {VECTOR_SOCKET}; see {VECTOR_SERVICE_LOG}"
++            );
++        }
+         thread::sleep(Duration::from_millis(100));
+     }
+ 
++    let pid = child.id();
++    let inode_exists = Path::new(VECTOR_SOCKET).exists();
++    // Do not leave a half-started daemon behind. A subsequent authenticated
++    // module retry must begin from either a registered socket or no launcher.
++    let _ = child.kill();
++    let _ = child.wait();
+     anyhow::bail!(
+-        "Vector adapter did not register {} within {} seconds (inode_exists={})",
++        "Vector service launcher pid={} did not register {} within {} seconds (inode_exists={}); launcher terminated; see {}",
++        pid,
+         VECTOR_SOCKET,
+         timeout.as_secs(),
+-        Path::new(VECTOR_SOCKET).exists()
++        inode_exists,
++        VECTOR_SERVICE_LOG
+     )
+ }
+ 
+-fn mark_vector_verification_log() -> Result<String> {
+-    let marker = format!("RMOP_PAD3_VECTOR_AUDIT_{}", std::process::id());
+-    let status = Command::new("/system/bin/log")
+-        .args(["-t", "RMOPVectorAudit", &marker])
+-        .status()
+-        .context("failed to write the Vector verification log marker")?;
+-    anyhow::ensure!(status.success(), "Vector log marker exited {status}");
+-    Ok(marker)
++fn system_server_replaced(old_system_servers: &[u32], current_system_servers: &[u32]) -> bool {
++    !current_system_servers.is_empty()
++        && old_system_servers
++            .iter()
++            .all(|old_pid| !current_system_servers.contains(old_pid))
++        && current_system_servers
++            .iter()
++            .any(|new_pid| !old_system_servers.contains(new_pid))
+ }
+ 
+-fn wait_activity_manager_ready() -> Result<()> {
+-    let timeout = Duration::from_secs(15);
++fn ensure_zygote_boundary_after_services(old_system_servers: &[u32]) -> Result<()> {
++    anyhow::ensure!(
++        !old_system_servers.is_empty(),
++        "system_server was not running before the service lifecycle"
++    );
++
++    // Zygisk providers may request their own zygote restart. Wait for that
++    // boundary first and never issue a second restart while it is converging.
++    let grace = Duration::from_secs(10);
+     let started = Instant::now();
+-    while started.elapsed() < timeout {
+-        let ready = Command::new("/system/bin/cmd")
+-            .args(["activity", "get-current-user"])
+-            .status()
+-            .map(|status| status.success())
+-            .unwrap_or(false);
+-        if ready {
++    while started.elapsed() < grace {
++        let current = process_ids("system_server");
++        let zygote_running = utils::getprop("init.svc.zygote").as_deref() == Some("running");
++        if zygote_running && system_server_replaced(old_system_servers, &current) {
++            info!(
++                "OnePlus Pad 3 late-load: service lifecycle already replaced system_server (old={old_system_servers:?}, new={current:?})"
++            );
++            append_module_lifecycle_log("service lifecycle supplied the zygote boundary");
++            thread::sleep(Duration::from_millis(500));
+             return Ok(());
+         }
+         thread::sleep(Duration::from_millis(250));
+     }
+-    anyhow::bail!(
+-        "replacement ActivityManager was not command-ready within {} seconds",
+-        timeout.as_secs()
+-    )
++
++    append_module_lifecycle_log("service lifecycle did not restart zygote; requesting one restart");
++    restart_zygote_for_late_modules()
+ }
+ 
+-fn run_vector_action() -> Result<()> {
+-    let action_path = Path::new(VECTOR_DIR).join("action.sh");
+-    require_vector_regular_script(&action_path, "action entrypoint")?;
++fn verify_vector_framework_cli() -> Result<()> {
++    let cli_path = Path::new(VECTOR_DIR).join("cli");
++    require_vector_regular_executable(&cli_path, "CLI")?;
++
++    let timeout = Duration::from_secs(20);
++    let deadline = Instant::now() + timeout;
++    let mut last_status = String::new();
++    while Instant::now() < deadline {
++        let mut output_file = create_public_log_exact(VECTOR_CLI_LOG, "Vector CLI log")?;
++        let stdout = output_file
++            .try_clone()
++            .context("failed to clone Vector CLI stdout log")?;
++        let stderr = output_file
++            .try_clone()
++            .context("failed to clone Vector CLI stderr log")?;
++        let mut child = match Command::new("/system/bin/sh")
++            .arg(&cli_path)
++            .args(["--json", "status"])
++            .stdout(Stdio::from(stdout))
++            .stderr(Stdio::from(stderr))
++            .spawn()
++        {
++            Ok(child) => child,
++            Err(error) => {
++                last_status = format!("exec failed: {error}");
++                thread::sleep(Duration::from_millis(250));
++                continue;
++            }
++        };
+ 
+-    let mut child = Command::new(assets::BUSYBOX_PATH)
+-        .current_dir(VECTOR_DIR)
+-        .arg("sh")
+-        .arg(&action_path)
+-        .envs(crate::module::get_common_script_envs(Some(
+-            VECTOR_MODULE_ID,
+-        )))
+-        .spawn()
+-        .context("failed to invoke Vector action.sh for bridge verification")?;
++        let call_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_secs(3));
++        let status = loop {
++            if let Some(status) = child
++                .try_wait()
++                .context("failed to query bounded Vector CLI child")?
++            {
++                break Some(status);
++            }
++            if Instant::now() >= call_deadline {
++                let _ = child.kill();
++                let _ = child.wait();
++                break None;
++            }
++            thread::sleep(Duration::from_millis(50));
++        };
+ 
+-    let timeout = Duration::from_secs(10);
+-    let started = Instant::now();
+-    while started.elapsed() < timeout {
+-        if let Some(status) = child
+-            .try_wait()
+-            .context("failed to wait for Vector action.sh")?
+-        {
+-            anyhow::ensure!(status.success(), "Vector action.sh exited {status}");
+-            return Ok(());
++        output_file
++            .seek(SeekFrom::Start(0))
++            .context("failed to rewind Vector CLI log")?;
++        let mut output_bytes = Vec::new();
++        output_file
++            .take(4097)
++            .read_to_end(&mut output_bytes)
++            .context("failed to read bounded Vector CLI log")?;
++        let output = String::from_utf8_lossy(&output_bytes);
++        match status {
++            Some(status) => {
++                let compact: String = output.chars().filter(|ch| !ch.is_whitespace()).collect();
++                if status.success()
++                    && compact.contains("\"success\":true")
++                    && output.contains("\"Framework Version\"")
++                {
++                    info!("OnePlus Pad 3 late-load: Vector CLI framework health verified");
++                    append_module_lifecycle_log("Vector CLI framework health verified");
++                    return Ok(());
++                }
++                last_status = format!(
++                    "exit={} output={}",
++                    status,
++                    output.trim().chars().take(3072).collect::<String>()
++                );
++            }
++            None => {
++                last_status = format!(
++                    "per-call timeout; output={}",
++                    output.trim().chars().take(3072).collect::<String>()
++                )
++            }
+         }
+-        thread::sleep(Duration::from_millis(100));
++        thread::sleep(Duration::from_millis(250));
+     }
+ 
+-    let _ = child.kill();
+-    let _ = child.wait();
+     anyhow::bail!(
+-        "Vector action.sh did not exit within {} seconds",
+-        timeout.as_secs()
++        "Vector CLI did not report a healthy framework within {} seconds: {}",
++        timeout.as_secs(),
++        last_status
+     )
+ }
+ 
+-fn verify_vector_system_server_bridge(marker: &str) -> Result<()> {
+-    wait_activity_manager_ready()?;
+-    run_vector_action()?;
+-
+-    let timeout = Duration::from_secs(15);
+-    let started = Instant::now();
+-    let mut saw_get_binder = false;
+-    let mut saw_parasitic_manager = false;
+-    let mut saw_serial_failure = false;
+-    while started.elapsed() < timeout {
+-        let output = Command::new("/system/bin/logcat")
+-            .args(["-d", "-v", "brief", "-t", "3000"])
+-            .output()
+-            .context("failed to read logcat for Vector bridge verification")?;
++fn run_module_service_lifecycle() -> Result<()> {
++    reset_module_lifecycle_log();
++    let old_system_servers = process_ids("system_server");
++    let vector_state = prepare_vector_service_stage()?;
++    let excluded_vector =
++        (vector_state != VectorServiceState::Disabled).then_some(VECTOR_MODULE_ID);
++
++    // Start regular module services while the current framework is alive.
++    // LSPosed's lspd and the Zygisk provider rendezvous must exist before the
++    // replacement zygote is created. Vector is reserved for the monitored
++    // launcher below so its long-lived daemon cannot be double-started.
++    init_event::run_stage_to_completion("service", excluded_vector, COMPLETION_SCRIPT_TIMEOUT)?;
++    append_module_lifecycle_log("generic service stage completed");
++
++    if vector_state == VectorServiceState::NeedsLaunch {
++        launch_vector_service_directly()?;
++    }
++    if vector_state != VectorServiceState::Disabled {
+         anyhow::ensure!(
+-            output.status.success(),
+-            "Vector audit logcat exited {}",
+-            output.status
++            vector_socket_registered(),
++            "Vector root-daemon socket disappeared before zygote recreation"
+         );
+-        let log = String::from_utf8_lossy(&output.stdout);
+-        if let Some(marker_position) = log.rfind(marker) {
+-            let current = &log[marker_position..];
+-            saw_get_binder |= current.contains("VectorZygiskBridge: onTransact: action=GET_BINDER");
+-            saw_parasitic_manager |= current.contains("ParasiticHooker:");
+-            saw_serial_failure |= current.contains("Failed to get system server binder via serial");
+-            if saw_get_binder && saw_parasitic_manager {
+-                info!(
+-                    "OnePlus Pad 3 late-load: Vector system_server bridge and parasitic manager verified"
+-                );
+-                return Ok(());
+-            }
++    }
++
++    ensure_zygote_boundary_after_services(&old_system_servers)?;
++    if vector_state != VectorServiceState::Disabled {
++        verify_vector_framework_cli()?;
++    }
++    append_module_lifecycle_log("service lifecycle verified");
++    Ok(())
++}
++
++fn activity_manager_ready() -> bool {
++    for _ in 0..40 {
++        let ready = Command::new("/system/bin/am")
++            .arg("get-current-user")
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status()
++            .is_ok_and(|status| status.success());
++        if ready {
++            return true;
+         }
+         thread::sleep(Duration::from_millis(250));
+     }
++    false
++}
+ 
+-    anyhow::bail!(
+-        "Vector bridge verification failed (GET_BINDER={saw_get_binder}, ParasiticHooker={saw_parasitic_manager}, serial_failure={saw_serial_failure})"
++fn restart_manager_after_late_load(package_name: &str) {
++    let package_valid = !package_name.is_empty()
++        && package_name
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'));
++    if !package_valid {
++        warn!("OnePlus Pad 3 late-load: refusing invalid Manager package name");
++        return;
++    }
++    if !activity_manager_ready() {
++        warn!(
++            "OnePlus Pad 3 late-load: ActivityManager was not command-ready; cannot refresh Manager {package_name}"
++        );
++        return;
++    }
++
++    info!("OnePlus Pad 3 late-load: refreshing KernelSU Manager {package_name}");
++    match Command::new("/system/bin/am")
++        .args(["force-stop", package_name])
++        .status()
++    {
++        Ok(status) if status.success() => {}
++        Ok(status) => warn!("OnePlus Pad 3 late-load: Manager force-stop exited {status}"),
++        Err(error) => warn!("OnePlus Pad 3 late-load: Manager force-stop failed: {error}"),
++    }
++
++    let component = format!("{package_name}/me.weishu.kernelsu.ui.MainActivity");
++    match Command::new("/system/bin/am")
++        .args(["start", "-n", &component])
++        .status()
++    {
++        Ok(status) if status.success() => {
++            info!("OnePlus Pad 3 late-load: KernelSU Manager restarted after module lifecycle");
++        }
++        Ok(status) => warn!("OnePlus Pad 3 late-load: Manager start exited {status}"),
++        Err(error) => warn!("OnePlus Pad 3 late-load: Manager start failed: {error}"),
++    }
++}
++
++fn ensure_private_receipt_directory() -> Result<()> {
++    match fs::symlink_metadata(PRIVATE_LATE_LOAD_ROOT) {
++        Ok(_) => validate_private_receipt_directory(),
++        Err(error) if error.kind() == ErrorKind::NotFound => {
++            fs::create_dir(PRIVATE_LATE_LOAD_ROOT)
++                .context("failed to create root-private module receipt directory")?;
++            let mut permissions = fs::metadata(PRIVATE_LATE_LOAD_ROOT)?.permissions();
++            permissions.set_mode(0o700);
++            fs::set_permissions(PRIVATE_LATE_LOAD_ROOT, permissions)
++                .context("failed to chmod root-private module receipt directory")?;
++            File::open("/data/adb")
++                .and_then(|directory| directory.sync_all())
++                .context("failed to sync /data/adb after receipt-directory creation")?;
++            validate_private_receipt_directory()
++        }
++        Err(error) => Err(error).context("failed to inspect root-private module receipt directory"),
++    }
++}
++
++fn validate_lower_hex(value: &str, length: usize, label: &str) -> Result<()> {
++    anyhow::ensure!(
++        value.len() == length
++            && value
++                .bytes()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
++        "{label} is not {length} lowercase hex characters"
++    );
++    Ok(())
++}
++
++struct RetryDaemonAuthority {
++    installed_parent: File,
++    installed_daemon: File,
++    device: u64,
++    inode: u64,
++    size: u64,
++    sha256: String,
++}
++
++impl RetryDaemonAuthority {
++    fn pin(expected_sha256: &str) -> Result<Self> {
++        validate_lower_hex(expected_sha256, 64, "expected retry ksud SHA-256")?;
++        let installed_parent = open_root_data_directory("/data/adb", "retry daemon parent")?;
++        let mut installed_daemon =
++            openat_readonly(&installed_parent, "ksud", "retry installed daemon")?;
++        let metadata = installed_daemon
++            .metadata()
++            .context("failed to fstat retry installed daemon")?;
++        anyhow::ensure!(
++            metadata.file_type().is_file()
++                && metadata.uid() == 0
++                && metadata.gid() == 0
++                && metadata.mode() & 0o777 == 0o755
++                && metadata.nlink() == 1
++                && metadata.len() > 0
++                && metadata.len() <= 64 * 1024 * 1024,
++            "retry /data/adb/ksud is not exact root:root 0755 nlink=1"
++        );
++
++        // The retry command must execute the same inode it authenticates and
++        // later commits into the completion receipt. This prevents a staged or
++        // replaced binary from authorizing a different installed ksud.
++        let current_executable =
++            File::open("/proc/self/exe").context("failed to pin current retry executable")?;
++        let executable_metadata = current_executable
++            .metadata()
++            .context("failed to fstat current retry executable")?;
++        anyhow::ensure!(
++            executable_metadata.dev() == metadata.dev()
++                && executable_metadata.ino() == metadata.ino()
++                && executable_metadata.len() == metadata.len(),
++            "module-retry is not executing the installed /data/adb/ksud inode"
++        );
++
++        let sha256 = digest_exact_file(
++            &mut installed_daemon,
++            metadata.len(),
++            "retry installed daemon",
++        )?;
++        anyhow::ensure!(
++            sha256 == expected_sha256,
++            "installed retry ksud SHA-256 does not match the app request pin"
++        );
++
++        Ok(Self {
++            installed_parent,
++            installed_daemon,
++            device: metadata.dev(),
++            inode: metadata.ino(),
++            size: metadata.len(),
++            sha256,
++        })
++    }
++
++    fn verify(&mut self) -> Result<()> {
++        validate_root_data_directory(&self.installed_parent, "retry daemon parent")?;
++        let retained = self
++            .installed_daemon
++            .metadata()
++            .context("failed to fstat retained retry daemon")?;
++        anyhow::ensure!(
++            retained.file_type().is_file()
++                && retained.uid() == 0
++                && retained.gid() == 0
++                && retained.mode() & 0o777 == 0o755
++                && retained.nlink() == 1
++                && retained.dev() == self.device
++                && retained.ino() == self.inode
++                && retained.len() == self.size,
++            "retained retry ksud identity changed during module lifecycle"
++        );
++        let path = fstatat_raw(
++            &self.installed_parent,
++            "ksud",
++            "retry installed daemon pathname",
++        )?;
++        anyhow::ensure!(
++            path.st_dev as u64 == self.device
++                && path.st_ino as u64 == self.inode
++                && u64::from(path.st_nlink) == 1
++                && path.st_uid == 0
++                && path.st_gid == 0
++                && (path.st_mode as u32 & 0o777) == 0o755
++                && path.st_size as u64 == self.size,
++            "current /data/adb/ksud no longer names the authenticated retry inode"
++        );
++        let digest = digest_exact_file(
++            &mut self.installed_daemon,
++            self.size,
++            "retained retry installed daemon",
++        )?;
++        anyhow::ensure!(
++            digest == self.sha256,
++            "retry installed daemon digest changed during module lifecycle"
++        );
++
++        let current_parent = open_root_data_directory("/data/adb", "current retry daemon parent")?;
++        let current_parent_metadata = current_parent
++            .metadata()
++            .context("failed to fstat current retry daemon parent")?;
++        let retained_parent_metadata = self
++            .installed_parent
++            .metadata()
++            .context("failed to fstat retained retry daemon parent")?;
++        anyhow::ensure!(
++            current_parent_metadata.dev() == retained_parent_metadata.dev()
++                && current_parent_metadata.ino() == retained_parent_metadata.ino(),
++            "/data/adb mount changed during module retry"
++        );
++        Ok(())
++    }
++}
++
++fn publish_private_receipt_exact(
++    private_receipts: &File,
++    run_id: &str,
++    content: &[u8],
++) -> Result<()> {
++    validate_cleanup_directory(private_receipts, true)?;
++    let temp_name = format!(".modules-loaded.tmp.{}.{}", std::process::id(), run_id);
++    let temp_c =
++        CString::new(temp_name.as_str()).context("private receipt temp name contains NUL")?;
++    let final_c = CString::new("modules-loaded").context("private receipt name contains NUL")?;
++    let fd = unsafe {
++        libc::openat(
++            private_receipts.as_raw_fd(),
++            temp_c.as_ptr(),
++            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
++            0o600,
++        )
++    };
++    if fd < 0 {
++        return Err(std::io::Error::last_os_error())
++            .context("failed to create private receipt temporary file");
++    }
++    let mut temporary = unsafe { File::from_raw_fd(fd) };
++    let result = (|| -> Result<()> {
++        let owned = unsafe { libc::fchown(temporary.as_raw_fd(), 0, 0) };
++        let chmod = unsafe { libc::fchmod(temporary.as_raw_fd(), 0o600) };
++        if owned != 0 || chmod != 0 {
++            return Err(std::io::Error::last_os_error())
++                .context("failed to secure private receipt temporary file");
++        }
++        temporary
++            .write_all(content)
++            .context("failed to write private receipt temporary file")?;
++        temporary
++            .sync_all()
++            .context("failed to sync private receipt temporary file")?;
++        let metadata = temporary
++            .metadata()
++            .context("failed to fstat private receipt temporary file")?;
++        anyhow::ensure!(
++            metadata.file_type().is_file()
++                && metadata.uid() == 0
++                && metadata.gid() == 0
++                && metadata.mode() & 0o777 == 0o600
++                && metadata.nlink() == 1
++                && metadata.len() == content.len() as u64,
++            "private receipt temporary metadata is not exact"
++        );
++        let path = fstatat_raw(
++            private_receipts,
++            &temp_name,
++            "private receipt temporary pathname",
++        )?;
++        anyhow::ensure!(
++            path.st_dev as u64 == metadata.dev() && path.st_ino as u64 == metadata.ino(),
++            "private receipt temporary pathname was replaced"
++        );
++        let renamed = unsafe {
++            libc::renameat(
++                private_receipts.as_raw_fd(),
++                temp_c.as_ptr(),
++                private_receipts.as_raw_fd(),
++                final_c.as_ptr(),
++            )
++        };
++        if renamed != 0 {
++            return Err(std::io::Error::last_os_error())
++                .context("failed to atomically publish private receipt");
++        }
++        private_receipts
++            .sync_all()
++            .context("failed to sync private receipt directory")?;
++        verify_receipt_exact(
++            private_receipts,
++            "modules-loaded",
++            content,
++            0o600,
++            "module-retry private completion receipt",
++        )
++    })();
++    if result.is_err()
++        && let Ok(path) = fstatat_raw(
++            private_receipts,
++            &temp_name,
++            "failed private receipt temporary pathname",
++        )
++        && let Ok(metadata) = temporary.metadata()
++        && path.st_dev == metadata.dev()
++        && path.st_ino == metadata.ino()
++    {
++        let _ = unsafe { libc::unlinkat(private_receipts.as_raw_fd(), temp_c.as_ptr(), 0) };
++        let _ = private_receipts.sync_all();
++    }
++    result
++}
++
++fn module_retry_receipt(run_id: &str, ksud_sha256: &str) -> Result<Vec<u8>> {
++    validate_lower_hex(run_id, 32, "module retry run id")?;
++    validate_lower_hex(ksud_sha256, 64, "module retry ksud SHA-256")?;
++    let boot_id = current_boot_id()?;
++    Ok(
++        format!("version=1\nboot_id={boot_id}\nrun_id={run_id}\nksud_sha256={ksud_sha256}\n")
++            .into_bytes(),
+     )
+ }
+ 
++fn module_retry_package_valid(package_name: &str) -> bool {
++    !package_name.is_empty()
++        && package_name
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
++}
++
++pub fn retry_modules(package_name: &str, run_id: &str, expected_ksud_sha256: &str) -> Result<()> {
++    validate_lower_hex(run_id, 32, "module retry run id")?;
++    validate_lower_hex(
++        expected_ksud_sha256,
++        64,
++        "expected module retry ksud SHA-256",
++    )?;
++    anyhow::ensure!(
++        module_retry_package_valid(package_name),
++        "module retry Manager package name is invalid"
++    );
++    require_exact_ksu_selinux_context()
++        .context("module retry did not start in the exact KernelSU SELinux domain")?;
++    anyhow::ensure!(
++        unsafe { libc::geteuid() } == 0 && unsafe { libc::getegid() } == 0,
++        "module retry executor is not root:root"
++    );
++    let enforcing = fs::read(SELINUX_ENFORCE_PATH)
++        .context("failed to read SELinux state before module retry")?;
++    anyhow::ensure!(
++        enforcing.as_slice() == b"1" || enforcing.as_slice() == b"1\n",
++        "module retry requires SELinux enforcing=1"
++    );
++    anyhow::ensure!(
++        !utils::has_magisk(),
++        "module retry was requested while Magisk is active"
++    );
++    anyhow::ensure!(
++        !utils::is_safe_mode(),
++        "module retry was requested while KernelSU safe mode is active"
++    );
++    verify_fresh_ksu_control().context("module retry KernelSU control preflight failed")?;
++
++    // The command is launched through `su -M`, but independently rejoin init's
++    // mount namespace so all OverlayFS mounts and module daemons outlive this
++    // process and are visible to zygote/system_server.
++    utils::switch_mnt_ns(1).context("failed to rejoin init mount namespace for module retry")?;
++    utils::reset_std().context("failed to reset stdio after joining init mount namespace")?;
++    utils::umask(0);
++    ensure_private_receipt_directory()?;
++
++    let mut daemon = RetryDaemonAuthority::pin(expected_ksud_sha256)?;
++    let private_receipts = open_cleanup_directory(PRIVATE_LATE_LOAD_ROOT, true)?;
++    let public_receipts = open_cleanup_directory("/data/local/tmp", false)?;
++    unlink_sync_prove_absent(
++        &private_receipts,
++        PRIVATE_LATE_LOAD_ROOT,
++        "modules-loaded",
++        true,
++    )?;
++    unlink_sync_prove_absent(
++        &public_receipts,
++        "/data/local/tmp",
++        ".ksu-late-load-modules-ok",
++        false,
++    )?;
++
++    info!("OnePlus Pad 3 module-retry: authenticated enforcing-state lifecycle started");
++    let operation = (|| -> Result<()> {
++        if let Err(error) = crate::module_config::clear_all_temp_configs() {
++            warn!("module retry clear temp configs failed: {error}");
++        }
++        if let Err(error) = handle_updated_modules() {
++            warn!("module retry handle updated modules failed: {error}");
++        }
++        if let Err(error) = prune_modules() {
++            warn!("module retry prune modules failed: {error}");
++        }
++        if let Err(error) = restorecon::restorecon() {
++            warn!("module retry restorecon failed: {error}");
++        }
++        if let Err(error) = crate::module::load_sepolicy_rule() {
++            warn!("module retry load sepolicy.rule failed: {error}");
++        }
++        if let Err(error) = crate::profile::apply_sepolies() {
++            warn!("module retry apply root profile sepolicy failed: {error}");
++        }
++        if let Err(error) = crate::feature::init_features() {
++            warn!("module retry feature initialization failed: {error}");
++        }
++
++        init_event::run_late_load_compat_stage()
++            .context("module retry late-load compatibility stage failed")?;
++        if let Err(error) = crate::module::load_system_prop() {
++            warn!("module retry load system.prop failed: {error}");
++        }
++        if let Err(error) = metamodule::exec_mount_script(defs::MODULE_DIR) {
++            warn!("module retry metamodule mount failed: {error}");
++        }
++        init_event::run_stage_checked("post-mount", true)
++            .context("module retry post-mount stage failed")?;
++        run_module_service_lifecycle().context("module retry service lifecycle failed")?;
++        init_event::run_stage_to_completion("boot-completed", None, COMPLETION_SCRIPT_TIMEOUT)
++            .context("module retry boot-completed stage failed")?;
++
++        daemon.verify()?;
++        verify_fresh_ksu_control().context("module retry final KernelSU control check failed")?;
++        let enforcing = fs::read(SELINUX_ENFORCE_PATH)
++            .context("failed to read final SELinux state after module retry")?;
++        anyhow::ensure!(
++            enforcing.as_slice() == b"1" || enforcing.as_slice() == b"1\n",
++            "SELinux was not enforcing after module retry"
++        );
++
++        let receipt = module_retry_receipt(run_id, &daemon.sha256)?;
++        publish_private_receipt_exact(&private_receipts, run_id, &receipt)?;
++        publish_public_receipt_exact(&public_receipts, run_id, &receipt)?;
++        verify_receipt_exact(
++            &private_receipts,
++            "modules-loaded",
++            &receipt,
++            0o600,
++            "module-retry private completion receipt",
++        )?;
++        verify_receipt_exact(
++            &public_receipts,
++            ".ksu-late-load-modules-ok",
++            &receipt,
++            0o644,
++            "module-retry public completion receipt",
++        )?;
++        daemon.verify()?;
++        verify_fresh_ksu_control().context("module retry post-receipt control check failed")?;
++        Ok(())
++    })();
++
++    if let Err(error) = operation {
++        let private_cleanup = unlink_sync_prove_absent(
++            &private_receipts,
++            PRIVATE_LATE_LOAD_ROOT,
++            "modules-loaded",
++            true,
++        );
++        let public_cleanup = unlink_sync_prove_absent(
++            &public_receipts,
++            "/data/local/tmp",
++            ".ksu-late-load-modules-ok",
++            false,
++        );
++        if let (Err(private_error), Err(public_error)) = (&private_cleanup, &public_cleanup) {
++            anyhow::bail!(
++                "module retry failed: {error:#}; both receipt cleanups failed: private={private_error:#}; public={public_error:#}"
++            );
++        }
++        if let Err(cleanup_error) = private_cleanup {
++            anyhow::bail!(
++                "module retry failed: {error:#}; private receipt cleanup failed: {cleanup_error:#}"
++            );
++        }
++        if let Err(cleanup_error) = public_cleanup {
++            anyhow::bail!(
++                "module retry failed: {error:#}; public receipt cleanup failed: {cleanup_error:#}"
++            );
++        }
++        return Err(error).context("OnePlus Pad 3 authenticated module retry failed");
++    }
++
++    append_module_lifecycle_log("authenticated module-retry receipt published");
++    restart_manager_after_late_load(package_name);
++    info!("OnePlus Pad 3 module-retry: lifecycle and receipts verified");
++    Ok(())
++}
++
+ fn dump_process_info(label: &str) {
+     use rustix::process::{getgid, getgroups, getpid, getuid};
+ 
+@@ -1608,7 +2507,7 @@ fn dump_process_info(label: &str) {
+ }
+ 
+ fn run_inner(
+-    _package_name: &String,
++    package_name: &String,
+     kmi: Option<String>,
+     allow_shell: bool,
+     modules: bool,
+@@ -1822,51 +2721,26 @@ fn run_inner(
+         init_event::run_stage_checked("post-mount", true)?;
+     }
+ 
+-    // 12. Recreate the zygote boundary, then execute normal service scripts
+-    // exactly once and wait for an exit receipt from every dispatched script.
++    // 12. Start all ordinary services while the current framework is alive,
++    // reserve Vector for its monitored Android-compatible launcher, then
++    // require one zygote/system_server boundary and verify the framework
++    // through Vector's official CLI. This avoids the old action.sh/UI/logcat
++    // bridge dependency and does not double-start Vector.
+     if run_module_scripts {
+-        let vector_adapter = vector_adapter_requested()?;
+-        let vector_log_marker = if vector_adapter {
+-            // Vector's stock service launcher cannot run on Android toybox.
+-            // Start only its dedicated provider adapter before zygote; all
+-            // normal service scripts remain undispatched until system_server
+-            // has been replaced.
+-            launch_vector_adapter()?;
+-            wait_vector_root_daemon()?;
+-            Some(mark_vector_verification_log()?)
+-        } else {
+-            None
+-        };
++        run_module_service_lifecycle()?;
+ 
+-        info!(
+-            "OnePlus Pad 3 late-load: provider preparation complete; restarting zygote before normal service stage"
+-        );
+-        restart_zygote_for_late_modules()?;
+-        info!(
+-            "OnePlus Pad 3 late-load: replacement system_server verified before exact-once service stage"
+-        );
+-
+-        let excluded_service_module = vector_adapter.then_some(VECTOR_MODULE_ID);
+-        init_event::run_stage_to_completion(
+-            "service",
+-            excluded_service_module,
+-            COMPLETION_SCRIPT_TIMEOUT,
+-        )?;
+-        info!(
+-            "OnePlus Pad 3 late-load: exact-once service stage completed with verified exit statuses"
+-        );
+-
+-        if let Some(marker) = vector_log_marker.as_deref() {
+-            verify_vector_system_server_bridge(marker)?;
+-        }
+-
+-        // 13. boot-completed scripts are also completion-gated. A spawn,
+-        // nonzero exit, or timeout returns before the current-boot marker.
++        // 13. boot-completed scripts are completion-gated. A spawn, nonzero
++        // exit, or timeout returns before the trusted current-boot receipt.
+         init_event::run_stage_to_completion("boot-completed", None, COMPLETION_SCRIPT_TIMEOUT)?;
+         info!(
+             "OnePlus Pad 3 late-load: service and boot-completed receipts verified; enforcing trusted completion commit"
+         );
+         write_trusted_module_receipt(&staged_daemon, &expected_daemon_sha256)?;
++
++        // A Manager process started before KernelSU cannot acquire the driver
++        // fd retroactively. Refresh it only after the private receipt is
++        // durable; failure to launch the UI must not invalidate root.
++        restart_manager_after_late_load(package_name);
+     }
+ 
+     Ok(())

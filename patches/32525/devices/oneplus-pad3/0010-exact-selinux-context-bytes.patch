@@ -1,0 +1,41 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index 85b4fda..552e2d7 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -226,6 +226,7 @@ const CLEANUP_MODULES_ENV: &str = "KSU_LATE_LOAD_CLEANUP_MODULES";
+ const CLEANUP_MODULES_ENV: &str = "KSU_LATE_LOAD_CLEANUP_MODULES";
+ const CLEAN_ABORT_EXIT_STATUS: i32 = 200;
+ const CLEAN_SUCCESS_EXIT_STATUS: i32 = 201;
++const KSU_SELINUX_CONTEXT_BYTES: &[u8] = b"u:r:ksu:s0\0";
+ const PROC_SUPER_MAGIC: libc::c_long = 0x9fa0;
+ const SELINUX_MAGIC: libc::c_long = 0xf97c_ff8c;
+ const VECTOR_ADAPTER_SCRIPT: &str =
+@@ -804,17 +805,22 @@ fn capture_post_load_binding(
+     Ok((cleanup_original_kptr_from_env()?, run_id))
+ }
+ 
++fn require_exact_ksu_selinux_context() -> Result<()> {
++    let domain = fs::read("/proc/self/attr/current")
++        .context("failed to read cleanup executor SELinux context bytes")?;
++    anyhow::ensure!(
++        domain.as_slice() == KSU_SELINUX_CONTEXT_BYTES,
++        "post-load cleanup executor SELinux context bytes are not exact u:r:ksu:s0 NUL-terminated form"
++    );
++    Ok(())
++}
++
+ fn validate_post_load_executor(expectation: &PostLoadCleanupExpectation) -> Result<()> {
+     anyhow::ensure!(
+         expectation.module_loaded,
+         "post-load executor validation ran before module load completed"
+     );
+-    let domain = fs::read_to_string("/proc/self/attr/current")
+-        .context("failed to read cleanup executor SELinux domain")?;
+-    anyhow::ensure!(
+-        domain.trim() == "u:r:ksu:s0",
+-        "post-load cleanup executor is not in u:r:ksu:s0"
+-    );
++    require_exact_ksu_selinux_context()?;
+     anyhow::ensure!(
+         unsafe { libc::geteuid() } == 0 && unsafe { libc::getegid() } == 0,
+         "post-load cleanup executor is not root:root"

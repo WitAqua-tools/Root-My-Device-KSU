@@ -1,0 +1,43 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index 552e2d7..1f875b5 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -264,6 +264,17 @@ fn require_vector_regular_executable(path: &Path, label: &str) -> Result<()> {
+     Ok(())
+ }
+ 
++fn require_vector_regular_script(path: &Path, label: &str) -> Result<()> {
++    let metadata = fs::symlink_metadata(path)
++        .with_context(|| format!("Vector {label} is missing: {}", path.display()))?;
++    anyhow::ensure!(
++        metadata.file_type().is_file(),
++        "Vector {label} is not a regular file: {}",
++        path.display()
++    );
++    Ok(())
++}
++
+ fn vector_adapter_requested() -> Result<bool> {
+     let module_dir = Path::new(VECTOR_DIR);
+     if !module_dir.is_dir()
+@@ -290,9 +301,9 @@ fn vector_adapter_requested() -> Result<bool> {
+     let service_path = module_dir.join("service.sh");
+     let daemon_path = module_dir.join("daemon");
+     let action_path = module_dir.join("action.sh");
+-    require_vector_regular_executable(&service_path, "service entrypoint")?;
++    require_vector_regular_script(&service_path, "service entrypoint")?;
+     require_vector_regular_executable(&daemon_path, "daemon")?;
+-    require_vector_regular_executable(&action_path, "action entrypoint")?;
++    require_vector_regular_script(&action_path, "action entrypoint")?;
+ 
+     let service =
+         fs::read_to_string(&service_path).context("failed to inspect Vector service.sh")?;
+@@ -1494,7 +1505,7 @@ fn wait_activity_manager_ready() -> Result<()> {
+ 
+ fn run_vector_action() -> Result<()> {
+     let action_path = Path::new(VECTOR_DIR).join("action.sh");
+-    require_vector_regular_executable(&action_path, "action entrypoint")?;
++    require_vector_regular_script(&action_path, "action entrypoint")?;
+ 
+     let mut child = Command::new(assets::BUSYBOX_PATH)
+         .current_dir(VECTOR_DIR)

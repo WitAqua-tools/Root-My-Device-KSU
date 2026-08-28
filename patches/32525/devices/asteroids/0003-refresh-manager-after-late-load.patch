@@ -1,0 +1,68 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -290,1 +290,52 @@ fn process_id(name: &str) -> Option<String> {
++fn activity_manager_ready() -> bool {
++    for _ in 0..40 {
++        let ready = Command::new("/system/bin/am")
++            .arg("get-current-user")
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status()
++            .is_ok_and(|status| status.success());
++        if ready {
++            return true;
++        }
++        thread::sleep(Duration::from_millis(250));
++    }
++    false
++}
++
++fn restart_manager_after_late_load(package_name: &str) {
++    // The Manager may have been running before KernelSU was loaded. That
++    // process has no injected KSU fd and its process-global libsu shells have
++    // already fallen back to an unprivileged shell. Only a fresh Manager
++    // process can acquire the driver fd and enumerate modules correctly.
++    if !activity_manager_ready() {
++        warn!(
++            "Asteroids late-load: ActivityManager was not command-ready; cannot refresh Manager {package_name}"
++        );
++        return;
++    }
++
++    info!("Asteroids late-load: refreshing KernelSU Manager {package_name}");
++    match Command::new("/system/bin/am")
++        .args(["force-stop", package_name])
++        .status()
++    {
++        Ok(status) if status.success() => {}
++        Ok(status) => warn!("Asteroids late-load: Manager force-stop exited {status}; continuing"),
++        Err(error) => warn!("Asteroids late-load: Manager force-stop failed: {error}; continuing"),
++    }
++
++    let component = format!("{package_name}/me.weishu.kernelsu.ui.MainActivity");
++    match Command::new("/system/bin/am")
++        .args(["start", "-n", &component])
++        .status()
++    {
++        Ok(status) if status.success() => {
++            info!("Asteroids late-load: KernelSU Manager restarted after late-load");
++        }
++        Ok(status) => warn!("Asteroids late-load: Manager start exited {status}; continuing"),
++        Err(error) => warn!("Asteroids late-load: Manager start failed: {error}; continuing"),
++    }
++}
++
+ fn process_id(name: &str) -> Option<String> {
+@@ -376,3 +427,3 @@ fn dump_process_info(label: &str) {
+ pub fn run(
+-    _package_name: &String,
++    package_name: &str,
+     kmi: Option<String>,
+@@ -586,1 +637,6 @@ pub fn run(
++    // Refresh the Manager only after the requested module lifecycle and its
++    // current-boot completion marker are durable. This is best-effort: a UI
++    // launch failure must not invalidate an otherwise healthy root session.
++    restart_manager_after_late_load(package_name);
++
+     Ok(())

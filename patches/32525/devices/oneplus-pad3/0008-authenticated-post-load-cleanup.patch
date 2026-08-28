@@ -1,0 +1,432 @@
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -1,8 +1,10 @@
+ use anyhow::{Context, Result};
+-use log::{info, warn};
++use log::{error, info, warn};
+ use rustix::cstr;
++use std::ffi::CString;
+ use std::fs::{self, File, OpenOptions};
+-use std::io::{ErrorKind, Read, Write};
++use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
++use std::os::fd::AsRawFd;
+ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+ use std::os::unix::process::CommandExt;
+ use std::path::{Path, PathBuf};
+@@ -220,6 +222,11 @@
+ const STAGED_DAEMON_PATH_ENV: &str = "KSU_LATE_LOAD_STAGED_DAEMON";
+ const STAGED_DAEMON_SHA256_ENV: &str = "KSU_LATE_LOAD_STAGED_SHA256";
+ const COMPLETION_RUN_ID_ENV: &str = "KSU_LATE_LOAD_RUN_ID";
++const CLEANUP_ORIGINAL_KPTR_ENV: &str = "KSU_LATE_LOAD_CLEANUP_KPTR";
++const CLEANUP_MODULES_ENV: &str = "KSU_LATE_LOAD_CLEANUP_MODULES";
++const CLEAN_ABORT_EXIT_STATUS: i32 = 200;
++const PROC_SUPER_MAGIC: libc::c_long = 0x9fa0;
++const SELINUX_MAGIC: libc::c_long = 0xf97c_ff8c;
+ const VECTOR_ADAPTER_SCRIPT: &str =
+     r#"/system/bin/mount -o rslave none / || exit 1; exec "$1" --system-server-max-retry=3"#;
+ 
+@@ -318,6 +325,309 @@
+     remove_completion_path(MODULE_COMPLETION_MARKER, "public completion-marker mirror")
+ }
+ 
++fn validate_cleanup_directory(directory: &File, private_root: bool) -> Result<()> {
++    let metadata = directory
++        .metadata()
++        .context("failed to fstat retained cleanup directory")?;
++    anyhow::ensure!(
++        metadata.file_type().is_dir(),
++        "retained cleanup authority is not a directory"
++    );
++    if private_root {
++        anyhow::ensure!(
++            metadata.uid() == 0 && metadata.gid() == 0 && metadata.mode() & 0o777 == 0o700,
++            "private cleanup authority is not root:root mode 0700"
++        );
++    } else {
++        anyhow::ensure!(
++            metadata.uid() == 2000 && metadata.gid() == 2000 && metadata.mode() & 0o777 == 0o771,
++            "public cleanup authority is not shell:shell mode 0771"
++        );
++    }
++    Ok(())
++}
++
++fn open_cleanup_directory(path: &str, private_root: bool) -> Result<File> {
++    let directory = OpenOptions::new()
++        .read(true)
++        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++        .open(path)
++        .with_context(|| format!("failed to pin cleanup directory {path}"))?;
++    validate_cleanup_directory(&directory, private_root)?;
++    Ok(directory)
++}
++
++fn validate_regular_authority(
++    file: &File,
++    expected_fs_magic: libc::c_long,
++    label: &str,
++) -> Result<()> {
++    let metadata = file
++        .metadata()
++        .with_context(|| format!("failed to fstat retained {label}"))?;
++    anyhow::ensure!(
++        metadata.file_type().is_file()
++            && metadata.uid() == 0
++            && metadata.gid() == 0
++            && metadata.nlink() == 1
++            && metadata.mode() & 0o777 == 0o644,
++        "retained {label} metadata is not root:root regular mode 0644 nlink=1"
++    );
++    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
++    let result = unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) };
++    if result != 0 {
++        return Err(std::io::Error::last_os_error())
++            .with_context(|| format!("failed to fstatfs retained {label}"));
++    }
++    let filesystem = unsafe { filesystem.assume_init() };
++    anyhow::ensure!(
++        filesystem.f_type as libc::c_long == expected_fs_magic,
++        "retained {label} has the wrong filesystem type"
++    );
++    Ok(())
++}
++
++fn open_regular_authority(
++    path: &str,
++    expected_fs_magic: libc::c_long,
++    label: &str,
++) -> Result<File> {
++    let file = OpenOptions::new()
++        .read(true)
++        .write(true)
++        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
++        .open(path)
++        .with_context(|| format!("failed to pin {label}"))?;
++    validate_regular_authority(&file, expected_fs_magic, label)?;
++    Ok(file)
++}
++
++fn unlink_sync_prove_absent(
++    directory: &File,
++    directory_path: &str,
++    name: &str,
++    private_root: bool,
++) -> Result<()> {
++    validate_cleanup_directory(directory, private_root)?;
++    let directory_identity = directory
++        .metadata()
++        .context("failed to snapshot retained cleanup directory identity")?;
++    let name = CString::new(name).context("cleanup receipt name contains NUL")?;
++    let removed = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
++    if removed != 0 {
++        let error = std::io::Error::last_os_error();
++        if error.kind() != ErrorKind::NotFound {
++            return Err(error).context("failed to unlink cleanup receipt through retained fd");
++        }
++    }
++    directory
++        .sync_all()
++        .context("failed to sync retained cleanup receipt directory")?;
++
++    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
++    let present = unsafe {
++        libc::fstatat(
++            directory.as_raw_fd(),
++            name.as_ptr(),
++            metadata.as_mut_ptr(),
++            libc::AT_SYMLINK_NOFOLLOW,
++        )
++    };
++    if present == 0 {
++        anyhow::bail!("cleanup receipt survived retained-fd unlink and directory sync");
++    }
++    let error = std::io::Error::last_os_error();
++    anyhow::ensure!(
++        error.kind() == ErrorKind::NotFound,
++        "cleanup receipt absence could not be proved through retained fd: {error}"
++    );
++    let path_identity = open_cleanup_directory(directory_path, private_root)?
++        .metadata()
++        .context("failed to recheck cleanup directory pathname identity")?;
++    anyhow::ensure!(
++        path_identity.dev() == directory_identity.dev()
++            && path_identity.ino() == directory_identity.ino(),
++        "cleanup directory pathname changed after its authority fd was pinned"
++    );
++    Ok(())
++}
++
++fn read_exact_digit(file: &mut File, label: &str) -> Result<u8> {
++    file.seek(SeekFrom::Start(0))
++        .with_context(|| format!("failed to seek retained {label}"))?;
++    let mut value = Vec::new();
++    file.read_to_end(&mut value)
++        .with_context(|| format!("failed to read retained {label}"))?;
++    match value.as_slice() {
++        b"0" | b"0\n" => Ok(b'0'),
++        b"1" | b"1\n" => Ok(b'1'),
++        b"2" | b"2\n" => Ok(b'2'),
++        _ => anyhow::bail!("retained {label} did not contain one exact digit"),
++    }
++}
++
++fn restore_kptr_restrict_exact(file: &mut File, original: u8) -> Result<()> {
++    validate_regular_authority(file, PROC_SUPER_MAGIC, "kptr_restrict")?;
++    file.seek(SeekFrom::Start(0))
++        .context("failed to seek retained kptr_restrict for restore")?;
++    file.write_all(&[original, b'\n'])
++        .context("failed to restore kptr_restrict through retained fd")?;
++    anyhow::ensure!(
++        read_exact_digit(file, "kptr_restrict")? == original,
++        "retained kptr_restrict cleanup readback did not match the original value"
++    );
++    Ok(())
++}
++
++fn ensure_enforcing_exact(file: &mut File) -> Result<()> {
++    validate_regular_authority(file, SELINUX_MAGIC, "SELinux enforcing state")?;
++    if read_exact_digit(file, "SELinux enforcing state")? == b'1' {
++        return Ok(());
++    }
++    file.seek(SeekFrom::Start(0))
++        .context("failed to seek retained SELinux enforcing state")?;
++    file.write_all(b"1")
++        .context("failed to restore SELinux enforcing through retained fd")?;
++    match file.sync_all() {
++        Ok(()) => {}
++        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
++        Err(error) => return Err(error).context("failed to sync SELinux enforcing state"),
++    }
++    anyhow::ensure!(
++        read_exact_digit(file, "SELinux enforcing state")? == b'1',
++        "retained SELinux enforcing cleanup readback was not exactly one"
++    );
++    Ok(())
++}
++
++struct CleanupAuthorities {
++    kptr_restrict: File,
++    selinux_enforce: File,
++    private_receipts: File,
++    public_receipts: File,
++}
++
++impl CleanupAuthorities {
++    fn pin_after_load() -> Result<Self> {
++        let mut kptr_restrict = open_regular_authority(
++            "/proc/sys/kernel/kptr_restrict",
++            PROC_SUPER_MAGIC,
++            "kptr_restrict",
++        )?;
++        anyhow::ensure!(
++            read_exact_digit(&mut kptr_restrict, "kptr_restrict")? == b'0',
++            "kptr_restrict was not exactly zero when its cleanup fd was pinned"
++        );
++        let mut selinux_enforce = open_regular_authority(
++            SELINUX_ENFORCE_PATH,
++            SELINUX_MAGIC,
++            "SELinux enforcing state",
++        )?;
++        anyhow::ensure!(
++            read_exact_digit(&mut selinux_enforce, "SELinux enforcing state")? == b'1',
++            "SELinux was not exactly enforcing when its cleanup fd was pinned"
++        );
++        Ok(Self {
++            kptr_restrict,
++            selinux_enforce,
++            private_receipts: open_cleanup_directory(PRIVATE_LATE_LOAD_ROOT, true)?,
++            public_receipts: open_cleanup_directory("/data/local/tmp", false)?,
++        })
++    }
++}
++
++struct PostLoadCleanupExpectation {
++    expected_daemon_sha256: String,
++    cleanup_modules: bool,
++    authorities: Option<CleanupAuthorities>,
++}
++
++fn cleanup_post_load_failure(expectation: &mut PostLoadCleanupExpectation) -> Result<()> {
++    let domain = fs::read_to_string("/proc/self/attr/current")
++        .context("failed to read cleanup executor SELinux domain")?;
++    anyhow::ensure!(
++        domain.trim() == "u:r:ksu:s0",
++        "post-load cleanup executor is not in u:r:ksu:s0"
++    );
++    anyhow::ensure!(
++        unsafe { libc::geteuid() } == 0 && unsafe { libc::getegid() } == 0,
++        "post-load cleanup executor is not root:root"
++    );
++    anyhow::ensure!(
++        std::env::var(STAGED_DAEMON_SHA256_ENV).as_deref()
++            == Ok(expectation.expected_daemon_sha256.as_str()),
++        "post-load cleanup daemon digest is not the staged build pin"
++    );
++    let modules_env =
++        std::env::var(CLEANUP_MODULES_ENV).context("post-load cleanup module flag is missing")?;
++    anyhow::ensure!(
++        modules_env
++            == if expectation.cleanup_modules {
++                "1"
++            } else {
++                "0"
++            },
++        "post-load cleanup module flag does not match the invocation"
++    );
++    if expectation.cleanup_modules {
++        completion_run_id().context("post-load cleanup run binding is invalid")?;
++    }
++    let original = std::env::var(CLEANUP_ORIGINAL_KPTR_ENV)
++        .context("post-load cleanup original kptr value is missing")?;
++    let original = match original.as_bytes() {
++        b"0" => b'0',
++        b"1" => b'1',
++        b"2" => b'2',
++        _ => anyhow::bail!("post-load cleanup original kptr value is invalid"),
++    };
++
++    // Attempt every independent rollback before deciding whether the reserved
++    // authenticated exit may be used. A single failed proof leaves ksud on its
++    // ordinary error path and the C watcher retains its fail-stop lock.
++    let authorities = expectation
++        .authorities
++        .as_mut()
++        .context("post-load cleanup authority fds were not pinned after module load")?;
++    let kptr = restore_kptr_restrict_exact(&mut authorities.kptr_restrict, original);
++    let trusted = expectation.cleanup_modules.then(|| {
++        unlink_sync_prove_absent(
++            &authorities.private_receipts,
++            PRIVATE_LATE_LOAD_ROOT,
++            "modules-loaded",
++            true,
++        )
++    });
++    let public = expectation.cleanup_modules.then(|| {
++        unlink_sync_prove_absent(
++            &authorities.public_receipts,
++            "/data/local/tmp",
++            ".ksu-late-load-modules-ok",
++            false,
++        )
++    });
++    let enforcing = ensure_enforcing_exact(&mut authorities.selinux_enforce);
++
++    let mut failures = Vec::new();
++    if let Err(error) = kptr {
++        failures.push(format!("kptr_restrict: {error:#}"));
++    }
++    if let Some(Err(error)) = trusted {
++        failures.push(format!("trusted receipt: {error:#}"));
++    }
++    if let Some(Err(error)) = public {
++        failures.push(format!("public receipt: {error:#}"));
++    }
++    if let Err(error) = enforcing {
++        failures.push(format!("SELinux enforcing: {error:#}"));
++    }
++    anyhow::ensure!(
++        failures.is_empty(),
++        "post-load cleanup proof incomplete: {}",
++        failures.join("; ")
++    );
++    Ok(())
++}
++
+ fn vector_socket_registered() -> bool {
+     fs::read_to_string("/proc/net/unix")
+         .map(|table| {
+@@ -376,10 +686,7 @@
+     let started = Instant::now();
+     while started.elapsed() < timeout {
+         if vector_socket_registered() {
+-            info!(
+-                "OnePlus Pad 3 late-load: live {} registration verified",
+-                VECTOR_SOCKET
+-            );
++            info!("OnePlus Pad 3 late-load: live {VECTOR_SOCKET} registration verified");
+             return Ok(());
+         }
+         thread::sleep(Duration::from_millis(100));
+@@ -527,11 +834,12 @@
+     );
+ }
+ 
+-pub fn run(
++fn run_inner(
+     _package_name: &String,
+     kmi: Option<String>,
+     allow_shell: bool,
+     modules: bool,
++    cleanup_expectation: &mut Option<PostLoadCleanupExpectation>,
+ ) -> Result<()> {
+     info!("late-load command triggered!");
+     dump_process_info("late-load start");
+@@ -584,6 +892,20 @@
+             cstr!("")
+         };
+         ksuinit::load_module(&ko_data, params).context("Failed to load kernelsu.ko")?;
++        /* Set the expectation before any fallible post-load setup. If even an
++         * authority fd cannot be pinned, the outer explicit error path knows
++         * that KernelSU loaded but cannot emit the reserved cleanup proof. */
++        *cleanup_expectation = Some(PostLoadCleanupExpectation {
++            expected_daemon_sha256: expected_daemon_sha256.clone(),
++            cleanup_modules: run_module_scripts,
++            authorities: None,
++        });
++        let authorities = CleanupAuthorities::pin_after_load()
++            .context("failed to pin post-load cleanup authorities")?;
++        cleanup_expectation
++            .as_mut()
++            .context("post-load cleanup expectation disappeared")?
++            .authorities = Some(authorities);
+         info!("kernelsu.ko loaded successfully!");
+         dump_process_info("after load_module");
+     }
+@@ -759,3 +1081,46 @@
+ 
+     Ok(())
+ }
++
++pub fn run(
++    package_name: &String,
++    kmi: Option<String>,
++    allow_shell: bool,
++    modules: bool,
++) -> Result<()> {
++    let mut cleanup_expectation = None;
++    match run_inner(
++        package_name,
++        kmi,
++        allow_shell,
++        modules,
++        &mut cleanup_expectation,
++    ) {
++        Ok(()) => Ok(()),
++        Err(operation_error) => {
++            let Some(mut expectation) = cleanup_expectation else {
++                return Err(operation_error);
++            };
++            match cleanup_post_load_failure(&mut expectation) {
++                Ok(()) => {
++                    error!(
++                        "OnePlus Pad 3 late-load failed after KernelSU load; exact retained-fd ksu-domain rollback completed: {operation_error:#}"
++                    );
++                    // C authenticates this reserved value with waitpid() of
++                    // the direct inode/hash-pinned loader child and the empty
++                    // exec-error pipe. Panic=abort and signals never reach
++                    // this branch and therefore cannot forge cleanup proof.
++                    std::process::exit(CLEAN_ABORT_EXIT_STATUS);
++                }
++                Err(cleanup_error) => {
++                    error!(
++                        "OnePlus Pad 3 post-load cleanup incomplete; C watcher must remain fail-stop: {cleanup_error:#}"
++                    );
++                    Err(operation_error).context(format!(
++                        "post-load cleanup proof was not emitted: {cleanup_error:#}"
++                    ))
++                }
++            }
++        }
++    }
++}
+

@@ -1,0 +1,244 @@
+diff --git a/userspace/ksud/src/cli.rs b/userspace/ksud/src/cli.rs
+index b588c11c..48cb1b0d 100644
+--- a/userspace/ksud/src/cli.rs
++++ b/userspace/ksud/src/cli.rs
+@@ -51,6 +51,11 @@ enum Commands {
+         #[arg(long)]
+         allow_shell: bool,
+
++        /// Run late-load compatible module stages. Modules with late-load.sh
++        /// use it; modules without one fall back to post-fs-data.sh.
++        #[arg(long)]
++        modules: bool,
++
+         /// Restore adb properties after magica late-load
+         #[arg(long)]
+         post_magica: bool,
+@@ -623,6 +628,7 @@ pub fn run() -> Result<()> {
+         Commands::LateLoad {
+             magica,
+             allow_shell,
++            modules,
+             post_magica,
+             kmi,
+             package_name,
+@@ -633,7 +639,7 @@ pub fn run() -> Result<()> {
+                     e
+                 });
+             }
+-            let result = crate::late_load::run(&package_name, kmi, allow_shell);
++            let result = crate::late_load::run(&package_name, kmi, allow_shell, modules);
+             if post_magica {
+                 info!("Restoring adb properties (post-magica cleanup)...");
+                 if let Err(e) = crate::magica::disable_adb_root() {
+diff --git a/userspace/ksud/src/init_event.rs b/userspace/ksud/src/init_event.rs
+index fa37b000..5c1ba6c0 100644
+--- a/userspace/ksud/src/init_event.rs
++++ b/userspace/ksud/src/init_event.rs
+@@ -155,6 +155,42 @@ pub fn run_stage(stage: &str, block: bool) {
+     }
+ }
+
++/// Run the module stage used by the explicit late-load compatibility mode.
++///
++/// General scripts deliberately stay on `late-load.d`: silently replaying the
++/// machine-wide `post-fs-data.d` directory after Android has booted is too
++/// broad. For the metamodule and each enabled module, `late-load.sh` is
++/// preferred and `post-fs-data.sh` is used only when no late-load-specific
++/// script exists. This preserves the normal pre-mount ordering without double
++/// starting modules that already know how to late-load.
++pub fn run_late_load_compat_stage() {
++    utils::umask(0);
++
++    if utils::has_magisk() {
++        warn!("Magisk detected, skip late-load compatibility stage");
++        return;
++    }
++
++    if crate::utils::is_safe_mode() {
++        warn!("safe mode, skip late-load compatibility scripts");
++        return;
++    }
++
++    if let Err(e) = crate::module::exec_common_scripts("late-load.d", true) {
++        warn!("Failed to exec common late-load scripts: {e}");
++    }
++
++    if let Err(e) = metamodule::exec_stage_script_with_fallback("late-load", "post-fs-data", true) {
++        warn!("Failed to exec metamodule late-load compatibility script: {e}");
++    }
++
++    if let Err(e) =
++        crate::module::exec_stage_script_with_fallback("late-load", "post-fs-data", true)
++    {
++        warn!("Failed to exec module late-load compatibility scripts: {e}");
++    }
++}
++
+ pub fn on_services() {
+     if ksucalls::is_uapi_version_mismatch() {
+         error!("Kernel and userspace uapi version mismatch! skip on_services");
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index db4c56aa..66356cf1 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -34,10 +34,20 @@ fn dump_process_info(label: &str) {
+     );
+ }
+
+-pub fn run(_package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
++pub fn run(
++    _package_name: &String,
++    kmi: Option<String>,
++    allow_shell: bool,
++    modules: bool,
++) -> Result<()> {
+     info!("late-load command triggered!");
+     dump_process_info("late-load start");
+
++    let run_module_scripts = modules
++        || std::env::var("KSU_LATE_LOAD_MODULES")
++            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
++            .unwrap_or(false);
++
+     // Copy the daemon before loading the module changes this process's
+     // security context. The remaining install steps require KernelSU policy.
+     utils::stage_daemon_from("/data/local/tmp/.ksud-stage").context("Failed to stage ksud")?;
+@@ -97,7 +107,14 @@ pub fn run(_package_name: &String, kmi: Option<String>, allow_shell: bool) -> Re
+     // that die with this process, while the daemons those scripts start keep
+     // running and expect them. At boot ksud is already in init's namespace and
+     // none of this arises; rejoining reproduces that.
+-    if let Err(e) = utils::switch_mnt_ns(1) {
++    if run_module_scripts {
++        // Module mounts and every daemon they launch must live in init's mount
++        // namespace. Continuing in the private loader namespace makes a
++        // successful-looking run disappear as soon as ksud exits, so this is
++        // fatal when module compatibility was explicitly requested.
++        utils::switch_mnt_ns(1)
++            .context("failed to rejoin init mount namespace for module stages")?;
++    } else if let Err(e) = utils::switch_mnt_ns(1) {
+         warn!("failed to rejoin init mount namespace: {e}");
+     }
+
+@@ -140,31 +157,21 @@ pub fn run(_package_name: &String, kmi: Option<String>, allow_shell: bool) -> Re
+         warn!("init features failed: {e}");
+     }
+
+-    // 8. Execute late-load stage scripts (blocking)
++    // 8. Execute the explicit late-load compatibility stage (blocking).
+     //
+-    // Module stage scripts assume the environment a boot gives them: their
+-    // module mounts already established, and no framework running yet. A
+-    // late-load can offer neither. What they do instead is start daemons --
+-    // a Zygisk implementation, LSPosed's lspd, Sui -- against a zygote that
+-    // is already serving, and those daemons restart it to inject. On warhol
+-    // that reliably kills system_server: it comes back up and dies in
+-    // ApplicationSharedMemory.nativeCreate with ENOENT, every time, until
+-    // the device is rebooted.
+-    //
+-    // So they are off unless asked for. KernelSU itself -- su, the manager,
+-    // the allowlist -- needs none of this; only modules do, and a module
+-    // that a late-load cannot mount is not one this should be starting.
+-    let run_module_scripts = std::env::var("KSU_LATE_LOAD_MODULES")
+-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+-        .unwrap_or(false);
++    // Normal late-load remains conservative: module scripts are disabled by
++    // default because Android is already live. When the caller opts in, run
++    // each module exactly once before any OverlayFS mount: prefer its
++    // late-load.sh, and only fall back to post-fs-data.sh for legacy modules
++    // that have no late-load-specific entry point. Global post-fs-data.d is
++    // intentionally not replayed. The Asteroids device patch recreates the
++    // zygote-start boundary after post-mount, before service.sh.
+-    if !run_module_scripts {
+-        warn!(
+-            "late-load: skipping module stage scripts (set KSU_LATE_LOAD_MODULES=1 to run them)"
+-        );
+-    }
+-
+-    if run_module_scripts {
+-        init_event::run_stage("late-load", true);
++    if run_module_scripts {
++        init_event::run_late_load_compat_stage();
++    } else {
++        warn!(
++            "late-load: skipping module stage scripts (pass --modules or set KSU_LATE_LOAD_MODULES=1)"
++        );
+     }
+
+     // 9. Load system.prop
+diff --git a/userspace/ksud/src/metamodule.rs b/userspace/ksud/src/metamodule.rs
+index 98594dbd..fbcad259 100644
+--- a/userspace/ksud/src/metamodule.rs
++++ b/userspace/ksud/src/metamodule.rs
+@@ -287,3 +287,24 @@ pub fn exec_stage_script(stage: &str, block: bool) -> Result<()> {
+     info!("Metamodule {stage}.sh executed successfully");
+     Ok(())
+ }
++
++/// Prefer a late-load-aware metamodule script and fall back to the normal
++/// post-fs-data script only when the primary script is absent.
++pub fn exec_stage_script_with_fallback(primary: &str, fallback: &str, block: bool) -> Result<()> {
++    let (stage, script_path) = if let Some(path) = check_metamodule_script(&format!("{primary}.sh"))
++    {
++        (primary, path)
++    } else if let Some(path) = check_metamodule_script(&format!("{fallback}.sh")) {
++        info!(
++            "late-load: metamodule has no {primary}.sh; using {fallback}.sh compatibility fallback"
++        );
++        (fallback, path)
++    } else {
++        return Ok(());
++    };
++
++    info!("Executing metamodule {stage}.sh");
++    crate::module::exec_script(&script_path, block)?;
++    info!("Metamodule {stage}.sh executed successfully");
++    Ok(())
++}
+diff --git a/userspace/ksud/src/module.rs b/userspace/ksud/src/module.rs
+index 25397c9d..fec9c49b 100644
+--- a/userspace/ksud/src/module.rs
++++ b/userspace/ksud/src/module.rs
+@@ -266,6 +266,42 @@ pub fn exec_stage_script(stage: &str, block: bool) -> Result<()> {
+     Ok(())
+ }
+
++/// Execute a late-load stage without running the same module twice.
++///
++/// A module that explicitly implements `primary` owns its late-load behavior.
++/// Legacy modules that only know the normal boot flow may instead provide
++/// `fallback`; those get that script once. The metamodule is handled by its
++/// own companion helper and is skipped here exactly as in exec_stage_script.
++pub fn exec_stage_script_with_fallback(primary: &str, fallback: &str, block: bool) -> Result<()> {
++    let metamodule_dir = metamodule::get_metamodule_path().and_then(|path| canonicalize(path).ok());
++
++    foreach_active_module(|module| {
++        if metamodule_dir.as_ref().is_some_and(|meta_dir| {
++            canonicalize(module).is_ok_and(|resolved| resolved == *meta_dir)
++        }) {
++            return Ok(());
++        }
++
++        let primary_path = module.join(format!("{primary}.sh"));
++        let fallback_path = module.join(format!("{fallback}.sh"));
++        let script_path = if primary_path.exists() {
++            primary_path
++        } else if fallback_path.exists() {
++            info!(
++                "late-load: {} has no {primary}.sh; using {fallback}.sh compatibility fallback",
++                module.display()
++            );
++            fallback_path
++        } else {
++            return Ok(());
++        };
++
++        exec_script(&script_path, block)
++    })?;
++
++    Ok(())
++}
++
+ /// Whether a process is still holding a module directory.
+ ///
+ /// Three ways it can, because the daemons that matter hold one in three

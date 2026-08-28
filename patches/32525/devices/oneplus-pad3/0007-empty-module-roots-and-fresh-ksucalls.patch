@@ -1,0 +1,186 @@
+diff --git a/userspace/ksud/src/ksucalls.rs b/userspace/ksud/src/ksucalls.rs
+index a7311831..dd14f1fd 100644
+--- a/userspace/ksud/src/ksucalls.rs
++++ b/userspace/ksud/src/ksucalls.rs
+@@ -48,35 +48,57 @@ fn init_driver_fd() -> Option<RawFd> {
+     }
+ }
+ 
++fn driver_fd() -> std::io::Result<RawFd> {
++    if let Some(fd) = DRIVER_FD.get() {
++        return Ok(*fd);
++    }
++
++    let fd = init_driver_fd().ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENODEV))?;
++    let _ = DRIVER_FD.set(fd);
++    Ok(*DRIVER_FD.get().unwrap_or(&fd))
++}
++
+ // ioctl wrapper using libc
+ fn ksuctl<T>(request: u32, arg: *mut T) -> std::io::Result<i32> {
+-    use std::io;
+-
+-    let fd = *DRIVER_FD.get_or_init(|| init_driver_fd().unwrap_or(-1));
++    let fd = driver_fd()?;
+     unsafe {
+         let ret = libc::ioctl(fd as libc::c_int, request as i32, arg);
+         if ret < 0 {
+-            Err(io::Error::last_os_error())
++            Err(std::io::Error::last_os_error())
+         } else {
+             Ok(ret)
+         }
+     }
+ }
+ 
++const fn empty_info() -> ksu_uapi::ksu_get_info_cmd {
++    ksu_uapi::ksu_get_info_cmd {
++        version: 0,
++        flags: 0,
++        features: 0,
++        uapi_version: 0,
++    }
++}
++
++fn query_info() -> std::io::Result<ksu_uapi::ksu_get_info_cmd> {
++    let mut cmd = empty_info();
++    if ksuctl(ksu_uapi::KSU_IOCTL_GET_INFO, &raw mut cmd).is_err() {
++        ksuctl(ksu_uapi::KSU_IOCTL_GET_INFO_LEGACY, &raw mut cmd)?;
++    }
++    Ok(cmd)
++}
++
++pub fn refresh_info() -> ksu_uapi::ksu_get_info_cmd {
++    let Ok(cmd) = query_info() else {
++        return empty_info();
++    };
++    let _ = INFO_CACHE.set(cmd);
++    cmd
++}
++
+ // API implementations
+ pub fn get_info() -> ksu_uapi::ksu_get_info_cmd {
+-    *INFO_CACHE.get_or_init(|| {
+-        let mut cmd = ksu_uapi::ksu_get_info_cmd {
+-            version: 0,
+-            flags: 0,
+-            features: 0,
+-            uapi_version: 0,
+-        };
+-        if ksuctl(ksu_uapi::KSU_IOCTL_GET_INFO, &raw mut cmd).is_err() {
+-            let _ = ksuctl(ksu_uapi::KSU_IOCTL_GET_INFO_LEGACY, &raw mut cmd);
+-        }
+-        cmd
+-    })
++    INFO_CACHE.get().map_or_else(refresh_info, |info| *info)
+ }
+ 
+ pub fn get_version() -> i32 {
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index 01cc93c0..216681cc 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -594,15 +594,28 @@ pub fn run(
+     // is the one line that says "it is loaded and answering" somewhere that
+     // survives.
+     {
+-        let info = crate::ksucalls::get_info();
++        let info = crate::ksucalls::refresh_info();
++        let late_load_mode = info.flags & crate::ksu_uapi::KSU_GET_INFO_FLAG_LATE_LOAD != 0;
+         info!(
+             "KernelSU live: version={} uapi={} flags=0x{:x} features=0x{:x} late_load={}",
+-            crate::ksucalls::get_version(),
+-            info.uapi_version,
+-            info.flags,
+-            info.features,
+-            crate::ksucalls::is_late_load()
++            info.version, info.uapi_version, info.flags, info.features, late_load_mode
+         );
++        if run_module_scripts {
++            anyhow::ensure!(
++                info.version != 0,
++                "KernelSU control info was unavailable after module load"
++            );
++            anyhow::ensure!(
++                info.uapi_version == crate::ksu_uapi::KERNEL_SU_UAPI_VERSION,
++                "KernelSU uapi mismatch after module load: kernel={} userspace={}",
++                info.uapi_version,
++                crate::ksu_uapi::KERNEL_SU_UAPI_VERSION
++            );
++            anyhow::ensure!(
++                late_load_mode,
++                "KernelSU did not report late-load mode after module load"
++            );
++        }
+     }
+ 
+     // Rejoin init's mount namespace before touching modules.
+diff --git a/userspace/ksud/src/module.rs b/userspace/ksud/src/module.rs
+index a1b6fe5f..5459455e 100644
+--- a/userspace/ksud/src/module.rs
++++ b/userspace/ksud/src/module.rs
+@@ -24,7 +24,7 @@ use std::{
+ };
+ use std::{
+     fs::{copy, rename},
+-    io::Write,
++    io::{ErrorKind, Write},
+ };
+ use zip_extensions::inflate::zip_extract::zip_extract_file_to_memory;
+ 
+@@ -135,7 +135,19 @@ pub fn foreach_module(
+         ModuleType::Updated => MODULE_UPDATE_DIR,
+         _ => defs::MODULE_DIR,
+     });
+-    let dir = std::fs::read_dir(modules_dir)?;
++    let dir = match std::fs::read_dir(modules_dir) {
++        Ok(dir) => dir,
++        Err(error) if error.kind() == ErrorKind::NotFound => {
++            // Late-load compatibility treats an absent module root as an empty module set.
++            // Permission failures and other real I/O errors still abort the stage.
++            info!(
++                "{} missing; treating as empty module set",
++                modules_dir.display()
++            );
++            return Ok(());
++        }
++        Err(error) => return Err(error.into()),
++    };
+     for entry in dir.flatten() {
+         let path = entry.path();
+         if !path.is_dir() {
+@@ -610,10 +622,14 @@ pub fn prune_modules() -> Result<()> {
+     })?;
+ 
+     // collect remaining modules, if none, clean up metamodule record
+-    let remaining_modules: Vec<_> = std::fs::read_dir(defs::MODULE_DIR)?
+-        .filter_map(std::result::Result::ok)
+-        .filter(|entry| entry.path().join("module.prop").exists())
+-        .collect();
++    let remaining_modules: Vec<_> = match std::fs::read_dir(defs::MODULE_DIR) {
++        Ok(entries) => entries
++            .filter_map(std::result::Result::ok)
++            .filter(|entry| entry.path().join("module.prop").exists())
++            .collect(),
++        Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
++        Err(error) => return Err(error.into()),
++    };
+ 
+     if remaining_modules.is_empty() {
+         info!("no remaining modules.");
+@@ -1037,7 +1053,14 @@ pub fn uninstall_all_modules() -> Result<()> {
+ 
+ fn mark_all_modules(flag_file: &str) -> Result<()> {
+     // we assume the module dir is already mounted
+-    let dir = std::fs::read_dir(defs::MODULE_DIR)?;
++    let dir = match std::fs::read_dir(defs::MODULE_DIR) {
++        Ok(dir) => dir,
++        Err(error) if error.kind() == ErrorKind::NotFound => {
++            info!("{} missing; treating as empty module set", defs::MODULE_DIR);
++            return Ok(());
++        }
++        Err(error) => return Err(error.into()),
++    };
+     for entry in dir.flatten() {
+         let path = entry.path();
+         let flag = path.join(flag_file);

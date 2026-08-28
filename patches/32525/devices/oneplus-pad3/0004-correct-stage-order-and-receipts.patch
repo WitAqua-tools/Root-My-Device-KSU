@@ -1,0 +1,470 @@
+diff --git a/userspace/ksud/src/init_event.rs b/userspace/ksud/src/init_event.rs
+index 0a6000f0..1c94f571 100644
+--- a/userspace/ksud/src/init_event.rs
++++ b/userspace/ksud/src/init_event.rs
+@@ -196,6 +196,38 @@ pub fn run_stage_except_module_checked(
+     Ok(())
+ }
+ 
++/// Dispatch a late-load completion stage and wait for every script receipt.
++/// Vector's long-lived daemon is launched by its dedicated adapter and can be
++/// excluded here; every script that remains must exit zero before its timeout.
++pub fn run_stage_to_completion(
++    stage: &str,
++    excluded_module: Option<&str>,
++    stage_timeout: std::time::Duration,
++) -> Result<()> {
++    utils::umask(0);
++
++    anyhow::ensure!(
++        !utils::has_magisk(),
++        "Magisk detected, refusing completion-checked {stage} stage"
++    );
++    anyhow::ensure!(
++        !crate::utils::is_safe_mode(),
++        "safe mode active, refusing completion-checked {stage} stage"
++    );
++    anyhow::ensure!(!stage_timeout.is_zero(), "{stage} stage timeout is zero");
++    let stage_deadline = std::time::Instant::now()
++        .checked_add(stage_timeout)
++        .context("stage deadline overflow")?;
++
++    crate::module::exec_common_scripts_until(&format!("{stage}.d"), stage_deadline)
++        .with_context(|| format!("common {stage} scripts did not complete"))?;
++    metamodule::exec_stage_script_until(stage, stage_deadline)
++        .with_context(|| format!("metamodule {stage} script did not complete"))?;
++    crate::module::exec_stage_script_except_until(stage, excluded_module, stage_deadline)
++        .with_context(|| format!("module {stage} scripts did not complete"))?;
++    Ok(())
++}
++
+ /// Run the module stage used by the explicit late-load compatibility mode.
+ ///
+ /// General scripts deliberately stay on `late-load.d`: silently replaying the
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index 00994cd8..687b0b1a 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -92,9 +92,26 @@ const VECTOR_MODULE_ID: &str = "zygisk_vector";
+ const VECTOR_DIR: &str = "/data/adb/modules/zygisk_vector";
+ const VECTOR_SOCKET: &str = "/data/adb/lspd/.cli_sock";
+ const MODULE_COMPLETION_MARKER: &str = "/data/local/tmp/.ksu-late-load-modules-ok";
++const COMPLETION_SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
+ const VECTOR_ADAPTER_SCRIPT: &str =
+     r#"/system/bin/mount -o rslave none / || exit 1; exec "$1" --system-server-max-retry=3"#;
+ 
++fn require_vector_regular_executable(path: &Path, label: &str) -> Result<()> {
++    let metadata = fs::symlink_metadata(path)
++        .with_context(|| format!("Vector {label} is missing: {}", path.display()))?;
++    anyhow::ensure!(
++        metadata.file_type().is_file(),
++        "Vector {label} is not a regular file: {}",
++        path.display()
++    );
++    anyhow::ensure!(
++        metadata.permissions().mode() & 0o111 != 0,
++        "Vector {label} is not executable: {}",
++        path.display()
++    );
++    Ok(())
++}
++
+ fn vector_adapter_requested() -> Result<bool> {
+     let module_dir = Path::new(VECTOR_DIR);
+     if !module_dir.is_dir()
+@@ -115,11 +132,16 @@ fn vector_adapter_requested() -> Result<bool> {
+         "Vector is the active metamodule; refusing an adapter launch that would duplicate its service stage"
+     );
+ 
++    // An enabled Vector installation is part of the requested completion
++    // contract even when its launcher is already Android-compatible. Refuse a
++    // partial or replaced installation instead of publishing a false marker.
+     let service_path = module_dir.join("service.sh");
+-    if !service_path.is_file() {
+-        info!("OnePlus Pad 3 late-load: Vector adapter skipped; service.sh is absent");
+-        return Ok(false);
+-    }
++    let daemon_path = module_dir.join("daemon");
++    let action_path = module_dir.join("action.sh");
++    require_vector_regular_executable(&service_path, "service entrypoint")?;
++    require_vector_regular_executable(&daemon_path, "daemon")?;
++    require_vector_regular_executable(&action_path, "action entrypoint")?;
++
+     let service =
+         fs::read_to_string(&service_path).context("failed to inspect Vector service.sh")?;
+     if !service.contains("unshare --propagation") {
+@@ -129,10 +151,6 @@ fn vector_adapter_requested() -> Result<bool> {
+         return Ok(false);
+     }
+ 
+-    anyhow::ensure!(
+-        module_dir.join("daemon").is_file(),
+-        "Vector service requires the Android unshare adapter but its daemon is absent"
+-    );
+     info!(
+         "OnePlus Pad 3 late-load: replacing one incompatible Vector service launch in ksud; module files remain unchanged"
+     );
+@@ -252,14 +270,9 @@ fn wait_activity_manager_ready() -> Result<()> {
+     )
+ }
+ 
+-fn run_vector_action() -> Result<bool> {
++fn run_vector_action() -> Result<()> {
+     let action_path = Path::new(VECTOR_DIR).join("action.sh");
+-    if !action_path.is_file() {
+-        warn!(
+-            "OnePlus Pad 3 late-load: Vector action.sh is absent; bridge/parasitic audit is not practical"
+-        );
+-        return Ok(false);
+-    }
++    require_vector_regular_executable(&action_path, "action entrypoint")?;
+ 
+     let mut child = Command::new(assets::BUSYBOX_PATH)
+         .current_dir(VECTOR_DIR)
+@@ -279,7 +292,7 @@ fn run_vector_action() -> Result<bool> {
+             .context("failed to wait for Vector action.sh")?
+         {
+             anyhow::ensure!(status.success(), "Vector action.sh exited {status}");
+-            return Ok(true);
++            return Ok(());
+         }
+         thread::sleep(Duration::from_millis(100));
+     }
+@@ -294,9 +307,7 @@ fn run_vector_action() -> Result<bool> {
+ 
+ fn verify_vector_system_server_bridge(marker: &str) -> Result<()> {
+     wait_activity_manager_ready()?;
+-    if !run_vector_action()? {
+-        return Ok(());
+-    }
++    run_vector_action()?;
+ 
+     let timeout = Duration::from_secs(15);
+     let started = Instant::now();
+@@ -530,35 +541,50 @@ pub fn run(
+         init_event::run_stage_checked("post-mount", true)?;
+     }
+ 
+-    // 12. Execute service stage scripts (non-blocking)
++    // 12. Recreate the zygote boundary, then execute normal service scripts
++    // exactly once and wait for an exit receipt from every dispatched script.
+     if run_module_scripts {
+         let vector_adapter = vector_adapter_requested()?;
+         let vector_log_marker = if vector_adapter {
+-            // Common and metamodule service stages still execute normally. The
+-            // stock Vector service is replaced, rather than replayed, so every
+-            // module receives exactly one service-stage launch.
+-            init_event::run_stage_except_module_checked("service", false, Some(VECTOR_MODULE_ID))?;
++            // Vector's stock service launcher cannot run on Android toybox.
++            // Start only its dedicated provider adapter before zygote; all
++            // normal service scripts remain undispatched until system_server
++            // has been replaced.
+             launch_vector_adapter()?;
+             wait_vector_root_daemon()?;
+-            Path::new(VECTOR_DIR)
+-                .join("action.sh")
+-                .is_file()
+-                .then(mark_vector_verification_log)
+-                .transpose()?
++            Some(mark_vector_verification_log()?)
+         } else {
+-            init_event::run_stage_checked("service", false)?;
+-            thread::sleep(Duration::from_millis(1000));
+             None
+         };
++
++        info!(
++            "OnePlus Pad 3 late-load: provider preparation complete; restarting zygote before normal service stage"
++        );
+         restart_zygote_for_late_modules()?;
++        info!(
++            "OnePlus Pad 3 late-load: replacement system_server verified before exact-once service stage"
++        );
++
++        let excluded_service_module = vector_adapter.then_some(VECTOR_MODULE_ID);
++        init_event::run_stage_to_completion(
++            "service",
++            excluded_service_module,
++            COMPLETION_SCRIPT_TIMEOUT,
++        )?;
++        info!(
++            "OnePlus Pad 3 late-load: exact-once service stage completed with verified exit statuses"
++        );
++
+         if let Some(marker) = vector_log_marker.as_deref() {
+             verify_vector_system_server_bridge(marker)?;
+         }
+-    }
+ 
+-    // 13. Execute boot-completed stage scripts (non-blocking)
+-    if run_module_scripts {
+-        init_event::run_stage_checked("boot-completed", false)?;
++        // 13. boot-completed scripts are also completion-gated. A spawn,
++        // nonzero exit, or timeout returns before the current-boot marker.
++        init_event::run_stage_to_completion("boot-completed", None, COMPLETION_SCRIPT_TIMEOUT)?;
++        info!(
++            "OnePlus Pad 3 late-load: service and boot-completed receipts verified; publishing current-boot marker"
++        );
+         write_module_completion_marker()?;
+     }
+ 
+diff --git a/userspace/ksud/src/metamodule.rs b/userspace/ksud/src/metamodule.rs
+index ce5c135d..f040ccad 100644
+--- a/userspace/ksud/src/metamodule.rs
++++ b/userspace/ksud/src/metamodule.rs
+@@ -288,6 +288,19 @@ pub fn exec_stage_script(stage: &str, block: bool) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Execute a late-load completion stage and require the metamodule script to
++/// exit successfully within the supplied timeout.
++pub fn exec_stage_script_until(stage: &str, stage_deadline: std::time::Instant) -> Result<()> {
++    let Some(script_path) = check_metamodule_script(&format!("{stage}.sh")) else {
++        return Ok(());
++    };
++
++    info!("Executing and verifying metamodule {stage}.sh");
++    crate::module::exec_script_until(&script_path, stage_deadline)?;
++    info!("Metamodule {stage}.sh exited successfully");
++    Ok(())
++}
++
+ /// Prefer a late-load-aware metamodule script and fall back to the normal
+ /// post-fs-data script only when the primary script is absent.
+ pub fn exec_stage_script_with_fallback(primary: &str, fallback: &str, block: bool) -> Result<()> {
+diff --git a/userspace/ksud/src/module.rs b/userspace/ksud/src/module.rs
+index bc758f17..a1b6fe5f 100644
+--- a/userspace/ksud/src/module.rs
++++ b/userspace/ksud/src/module.rs
+@@ -179,14 +179,11 @@ pub fn load_sepolicy_rule() -> Result<()> {
+     Ok(())
+ }
+ 
+-pub fn exec_script<T: AsRef<Path>>(path: T, wait: bool) -> Result<()> {
+-    info!("exec {}", path.as_ref().display());
+-
+-    let is_module_script = path.as_ref().starts_with(defs::MODULE_DIR);
++fn build_script_command(path: &Path) -> Command {
++    let is_module_script = path.starts_with(defs::MODULE_DIR);
+     // Extract module_id from path if it matches /data/adb/modules/{id}/...
+     let module_id = if is_module_script {
+-        path.as_ref()
+-            .strip_prefix(defs::MODULE_DIR)
++        path.strip_prefix(defs::MODULE_DIR)
+             .ok()
+             .and_then(|p| p.components().next())
+             .and_then(|c| c.as_os_str().to_str())
+@@ -206,7 +203,7 @@ pub fn exec_script<T: AsRef<Path>>(path: T, wait: bool) -> Result<()> {
+             Err(e) => {
+                 warn!(
+                     "Invalid module ID '{id}' extracted from script path '{}': {e}",
+-                    path.as_ref().display(),
++                    path.display(),
+                 );
+                 None
+             }
+@@ -215,34 +212,105 @@ pub fn exec_script<T: AsRef<Path>>(path: T, wait: bool) -> Result<()> {
+     if is_module_script && module_id.is_none() {
+         debug!(
+             "Failed to extract module_id from script path '{}'. Script will run without KSU_MODULE environment variable.",
+-            path.as_ref().display()
++            path.display()
+         );
+     }
+ 
+-    let mut command = &mut Command::new(assets::BUSYBOX_PATH);
++    let mut command = Command::new(assets::BUSYBOX_PATH);
+     #[cfg(unix)]
+-    {
+-        command = unsafe {
+-            command.pre_exec(|| {
+-                detach_process_group(true);
+-                // ignore the error?
+-                switch_cgroups();
+-                Ok(())
+-            })
+-        };
++    unsafe {
++        command.pre_exec(|| {
++            detach_process_group(true);
++            // ignore the error?
++            switch_cgroups();
++            Ok(())
++        });
+     }
+-    command = command
+-        .current_dir(path.as_ref().parent().unwrap())
++
++    command
++        .current_dir(path.parent().unwrap())
+         .arg("sh")
+-        .arg(path.as_ref())
++        .arg(path)
+         .envs(get_common_script_envs(validated_module_id));
+ 
+-    let result = if wait {
+-        command.status().map(|_| ())
++    command
++}
++
++pub fn exec_script<T: AsRef<Path>>(path: T, wait: bool) -> Result<()> {
++    let path = path.as_ref();
++    info!("exec {}", path.display());
++    let mut command = build_script_command(path);
++
++    if wait {
++        let status = command
++            .status()
++            .map_err(|e| anyhow!("Failed to exec {}: {e}", path.display()))?;
++        ensure!(
++            status.success(),
++            "Script {} exited with {status}",
++            path.display()
++        );
++        Ok(())
+     } else {
+-        command.spawn().map(|_| ())
+-    };
+-    result.map_err(|e| anyhow!("Failed to exec {}: {e}", path.as_ref().display()))
++        command
++            .spawn()
++            .map(|_| ())
++            .map_err(|e| anyhow!("Failed to exec {}: {e}", path.display()))
++    }
++}
++
++/// Execute one stage script and require a successful exit before its bounded
++/// deadline. This is used only by late-load completion receipts; normal boot
++/// service stages retain their asynchronous behavior.
++pub fn exec_script_until<T: AsRef<Path>>(
++    path: T,
++    stage_deadline: std::time::Instant,
++) -> Result<()> {
++    let path = path.as_ref();
++    let remaining = stage_deadline.saturating_duration_since(std::time::Instant::now());
++    ensure!(
++        !remaining.is_zero(),
++        "Stage deadline elapsed before dispatching {}",
++        path.display()
++    );
++    info!(
++        "exec and verify {} (stage deadline remaining={}ms)",
++        path.display(),
++        remaining.as_millis()
++    );
++
++    let mut child = build_script_command(path)
++        .spawn()
++        .map_err(|e| anyhow!("Failed to exec {}: {e}", path.display()))?;
++    loop {
++        if let Some(status) = child
++            .try_wait()
++            .with_context(|| format!("Failed to wait for {}", path.display()))?
++        {
++            ensure!(
++                status.success(),
++                "Script {} exited with {status}",
++                path.display()
++            );
++            return Ok(());
++        }
++
++        if std::time::Instant::now() >= stage_deadline {
++            let pid = child.id();
++            if let Err(error) = child.kill() {
++                warn!(
++                    "Failed to kill timed-out script {} pid={pid}: {error}",
++                    path.display()
++                );
++            }
++            let _ = child.wait();
++            bail!(
++                "Script {} reached the shared stage deadline (pid={pid})",
++                path.display(),
++            );
++        }
++        std::thread::sleep(std::time::Duration::from_millis(100));
++    }
+ }
+ 
+ pub fn exec_stage_script(stage: &str, block: bool) -> Result<()> {
+@@ -251,10 +319,10 @@ pub fn exec_stage_script(stage: &str, block: bool) -> Result<()> {
+ 
+ /// Execute a stage once for every active regular module except one module
+ /// whose service lifecycle is owned by a device adapter.
+-pub fn exec_stage_script_except(
++fn exec_stage_script_except_with(
+     stage: &str,
+-    block: bool,
+     excluded_module: Option<&str>,
++    mut execute: impl FnMut(&Path) -> Result<()>,
+ ) -> Result<()> {
+     let metamodule_dir = metamodule::get_metamodule_path().and_then(|path| canonicalize(path).ok());
+ 
+@@ -280,12 +348,32 @@ pub fn exec_stage_script_except(
+             return Ok(());
+         }
+ 
+-        exec_script(&script_path, block)
++        execute(&script_path)
+     })?;
+ 
+     Ok(())
+ }
+ 
++pub fn exec_stage_script_except(
++    stage: &str,
++    block: bool,
++    excluded_module: Option<&str>,
++) -> Result<()> {
++    exec_stage_script_except_with(stage, excluded_module, |script_path| {
++        exec_script(script_path, block)
++    })
++}
++
++pub fn exec_stage_script_except_until(
++    stage: &str,
++    excluded_module: Option<&str>,
++    stage_deadline: std::time::Instant,
++) -> Result<()> {
++    exec_stage_script_except_with(stage, excluded_module, |script_path| {
++        exec_script_until(script_path, stage_deadline)
++    })
++}
++
+ /// Execute a late-load stage without running the same module twice.
+ ///
+ /// A module that explicitly implements `primary` owns its late-load behavior.
+@@ -428,7 +516,7 @@ pub fn kill_leftover_daemons() {
+     );
+ }
+ 
+-pub fn exec_common_scripts(dir: &str, wait: bool) -> Result<()> {
++fn exec_common_scripts_with(dir: &str, mut execute: impl FnMut(&Path) -> Result<()>) -> Result<()> {
+     let script_dir = Path::new(defs::ADB_DIR).join(dir);
+     if !script_dir.exists() {
+         info!("{} not exists, skip", script_dir.display());
+@@ -444,12 +532,22 @@ pub fn exec_common_scripts(dir: &str, wait: bool) -> Result<()> {
+             continue;
+         }
+ 
+-        exec_script(path, wait)?;
++        execute(&path)?;
+     }
+ 
+     Ok(())
+ }
+ 
++pub fn exec_common_scripts(dir: &str, wait: bool) -> Result<()> {
++    exec_common_scripts_with(dir, |script_path| exec_script(script_path, wait))
++}
++
++pub fn exec_common_scripts_until(dir: &str, stage_deadline: std::time::Instant) -> Result<()> {
++    exec_common_scripts_with(dir, |script_path| {
++        exec_script_until(script_path, stage_deadline)
++    })
++}
++
+ pub fn load_system_prop() -> Result<()> {
+     foreach_active_module(|module| {
+         let system_prop = module.join("system.prop");
