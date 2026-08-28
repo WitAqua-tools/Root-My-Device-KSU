@@ -37,7 +37,7 @@ on:
       ksu_ref:
         description: KernelSU revision to build, and the one the patches must apply to
         required: true
-        default: b0bc817b4e966aa6aa830834eaf6ef765d821d40
+        default: 932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e
       release:
         description: publish a GitHub release as well as an artifact
         type: boolean
@@ -96,7 +96,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: tiann/KernelSU
-          ref: ${{ inputs.ksu_ref || 'b0bc817b4e966aa6aa830834eaf6ef765d821d40' }}
+          ref: ${{ inputs.ksu_ref || '932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e' }}
           path: kernelsu
           fetch-depth: 0
 
